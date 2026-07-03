@@ -2,6 +2,8 @@
 
 Capacitor 7 plugin for push notifications, in-app messaging (popup, banner, roadblock, inline, tooltip), event tracking, and session handling in Ionic/Capacitor apps (iOS + Android).
 
+**Documentation site:** [https://docs.mehery.com/guide/pushapp/ionic-sdk/](https://docs.mehery.com/guide/pushapp/ionic-sdk/) — hosted on [MeherY docs](https://docs.mehery.com/guide/pushapp/); HTML source in this repo under [`docs-site/`](docs-site/) (see [docs-site/README.md](docs-site/README.md)).
+
 ## Start here
 
 | I want to… | Read this |
@@ -40,13 +42,13 @@ Your app should include:
 
 - Firebase config: `android/app/google-services.json` and/or `ios/App/GoogleService-Info.plist`
 - Android Gradle: `google-services` plugin applied — see [Integration Guide §3b](docs/Integration-Guide.md#3b-android-gradle-required)
-- iOS Push Notifications capability + `AppDelegate` token forwarding — see [Integration Guide §4](docs/Integration-Guide.md#4-ios-native-setup)
+- iOS: **Firebase/Messaging** pod, Push Notifications capability, `AppDelegate` (APNs + FCM + notification taps) — see [Integration Guide §3–4](docs/Integration-Guide.md#3-firebase-setup)
 - SDK calls in order: **`initialize()` → `register()` → `login()`** (call **`logout()`** on sign-out)
 - After login (when needed): `saveUserData()`, `setPageName()`, `sendEvent()`
 - iOS notification tap tracking — see [Integration Guide §4b](docs/Integration-Guide.md#4b-ios-notification-open--cta-tracking)
 - Inline/tooltip registration only if your PushApp campaigns use those surfaces
 
-`register()` is safe to call on every app open — the native SDK **skips the register API** when the device is already registered with the same token. Customer profiles are **not** updated automatically; call `saveUserData()` explicitly after login.
+`register()` is safe to call on every app open — the native SDK avoids duplicate registration when the device is already registered with the same push token. If the token changes later, the SDK updates it automatically after the first successful registration. After **`logout()`**, the SDK clears local registration state and registers again as a fresh guest device. Customer profiles are **not** updated automatically; call `saveUserData()` explicitly after login.
 
 ---
 
@@ -69,6 +71,8 @@ import { environment } from '../environments/environment';
 
 await PushApp.initialize({
   appId: environment.pushApp.appId,
+  pushAppId: environment.pushApp.pushAppId,
+  appSecretKey: environment.pushApp.appSecretKey,
   sandbox: environment.pushApp.sandbox,
   debugMode: !environment.production && environment.pushApp.debugMode,
 });
@@ -86,7 +90,9 @@ Store credentials in environment files — do not hardcode in components:
 export const environment = {
   production: false,
   pushApp: {
-    appId: 'yourtenant_1234567890',
+    appId: 'yourtenant_1234567890', // channel id
+    pushAppId: 'pa_…', // PushApp API App Id
+    appSecretKey: 'pas_…', // PushApp App Secret Key
     sandbox: true,
     debugMode: true, // dev only — verbose native logs (tokens redacted)
   },
@@ -99,12 +105,12 @@ Do **not** pass `slackWebhookUrl` in production (integration debugging only).
 
 ## Environments
 
-The tenant subdomain comes from your App ID (e.g. `synapsewave` from `synapsewave_1773818143216`).
+Use the `sandbox` flag provided with your PushApp credentials:
 
-| `sandbox` | Environment | API base | WebSocket |
-|-----------|-------------|----------|-----------|
-| `false` | **Production** | `https://{tenant}.pushapp.ai` | `wss://{tenant}.pushapp.ai/pushapp` |
-| `true` | **Sandbox** | `https://{tenant}.pushapp.co.in` | `wss://{tenant}.pushapp.co.in/pushapp` |
+| `sandbox` | Environment |
+|-----------|-------------|
+| `false` | Production |
+| `true` | Sandbox / testing |
 
 ---
 
@@ -163,9 +169,8 @@ Full details: [Integration Guide §8](docs/Integration-Guide.md#tooltip-target)
 
 | Method | When to call |
 |--------|----------------|
-| `initialize({ appId, sandbox?, debugMode?, slackWebhookUrl? })` | App startup |
-| `register({ fcmToken })` | After initialize — Android |
-| `register({ apnsToken, fcmToken? })` | After initialize — iOS |
+| `initialize({ appId, pushAppId, appSecretKey, sandbox?, debugMode?, slackWebhookUrl? })` | App startup |
+| `register({ fcmToken?, apnsToken?, token? })` | After initialize — **both platforms**; pass empty `fcmToken` to use native cached tokens (recommended — see `pushapp-setup.ts`) |
 | `login({ userId })` | After register, when user signs in |
 | `logout()` | On sign-out — clears local session and delinks device on server |
 | `saveUserData({ code, additionalInfo, cohorts })` | After login |
@@ -225,9 +230,11 @@ Common codes: [Integration Guide §13](docs/Integration-Guide.md#13-error-handli
 
 ### iOS
 
-- Minimum iOS 15.2
+- Minimum iOS **15.2** (match `platform :ios` in `Podfile`)
 - Enable **Push Notifications** capability in Xcode
-- `AppDelegate`: forward APNs token + notification tap tracking — see [Integration Guide §4](docs/Integration-Guide.md#4-ios-native-setup)
+- Add **`pod 'Firebase/Messaging'`** to `ios/App/Podfile`, then `pod install`
+- `AppDelegate`: Firebase init, forward APNs token to Firebase + PushApp, handle FCM refresh, notification tap tracking — see [Integration Guide §4](docs/Integration-Guide.md#4-ios-native-setup)
+- Reference: `example-app/ios/App/App/AppDelegate.swift`
 
 ---
 
@@ -244,7 +251,7 @@ cd example-app && npm install && npx cap sync
 | `src/app/pushapp-setup.ts` | `initialize` + `register` with retry |
 | `src/app/login/login.page.ts` | `login` + `saveUserData` |
 | `src/app/home/home.page.ts` | `setPageName`, placeholders, tooltips, `logout` |
-| `ios/App/App/AppDelegate.swift` | APNs token + notification tap tracking |
+| `ios/App/App/AppDelegate.swift` | Firebase + APNs + FCM refresh + notification tap tracking |
 
 This is the **canonical integration pattern** — prefer it over ad-hoc snippets.
 
@@ -256,6 +263,7 @@ This is the **canonical integration pattern** — prefer it over ad-hoc snippets
 |-------|----------------|
 | `initialize` fails | App ID format: `tenant_suffix` (e.g. `demo_1763369170735`) |
 | `register` rejected | Call `initialize()` first; token may not be ready on first launch — use retry pattern from `pushapp-setup.ts` |
+| Token refresh / new FCM | Handled natively after first successful register (update API, not register) — no extra JS needed |
 | `login` rejected | Call `register()` successfully first |
 | No push on device | Real device required; verify Firebase config, Gradle plugin, and notification permissions |
 | Testing in browser | Expected: `WEB_NOT_SUPPORTED` — use a device |

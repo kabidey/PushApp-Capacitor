@@ -77,6 +77,20 @@ cd ios/App && pod install
 2. Download `GoogleService-Info.plist`.
 3. Add it to your Xcode app target (`ios/App/App/`).
 4. In Xcode, enable **Push Notifications** capability for your app target.
+5. Add Firebase Messaging to `ios/App/Podfile`:
+
+```ruby
+platform :ios, '15.2'  # SDK minimum
+
+target 'App' do
+  # ... Capacitor pods ...
+  pod 'Firebase/Messaging'
+end
+```
+
+6. Run `pod install` in `ios/App/`, then `npx cap sync ios`.
+
+Reference: `example-app/ios/App/Podfile`.
 
 ### 3b. Android Gradle (required)
 
@@ -128,25 +142,45 @@ Reference: `example-app/android/build.gradle` and `example-app/android/app/build
 
 ## 4. iOS native setup
 
-Update `ios/App/App/AppDelegate.swift` so push notifications work and the SDK receives the APNs token.
+Update `ios/App/App/AppDelegate.swift` so push notifications work, Firebase receives the APNs token, and the SDK receives both APNs and FCM tokens.
 
 ```swift
 import UserNotifications
 import PushappIonic
+import Firebase
+import FirebaseMessaging
 
-// AppDelegate must conform to UNUserNotificationCenterDelegate
-class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+// AppDelegate must conform to UNUserNotificationCenterDelegate and MessagingDelegate
+class AppDelegate: UIResponder, UIApplicationDelegate,
+                     UNUserNotificationCenterDelegate, MessagingDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        FirebaseApp.configure()
+        Messaging.messaging().delegate = self
         UNUserNotificationCenter.current().delegate = self
+
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            guard granted else { return }
+            DispatchQueue.main.async {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        }
         return true
     }
 
     func application(_ application: UIApplication,
                      didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        Messaging.messaging().apnsToken = deviceToken
         if #available(iOS 15.2, *) {
             PushApp.shared.handleDeviceToken(deviceToken)
+        }
+    }
+
+    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let fcmToken = fcmToken, !fcmToken.isEmpty else { return }
+        if #available(iOS 15.2, *) {
+            PushApp.shared.handleFcmTokenRefresh(fcmToken)
         }
     }
 
@@ -164,6 +198,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 ```
 
 **Minimum iOS version for the SDK:** 15.2
+
+Full working example (including notification tap tracking): `example-app/ios/App/App/AppDelegate.swift`
 
 ### 4b. iOS notification open / CTA tracking
 
@@ -251,6 +287,8 @@ export async function setupPushAppOnLaunch(): Promise<void> {
 
   await PushApp.initialize({
     appId: environment.pushApp.appId,
+    pushAppId: environment.pushApp.pushAppId,
+    appSecretKey: environment.pushApp.appSecretKey,
     sandbox: environment.pushApp.sandbox,
     debugMode: !environment.production && environment.pushApp.debugMode,
   });
@@ -316,6 +354,8 @@ On the login page, still call `setupPushAppOnLaunch()` so `initialize` + `regist
 ```typescript
 await PushApp.initialize({
   appId: environment.pushApp.appId,
+  pushAppId: environment.pushApp.pushAppId,
+  appSecretKey: environment.pushApp.appSecretKey,
   sandbox: environment.pushApp.sandbox,
   debugMode: environment.pushApp.debugMode, // optional — verbose logs in debug builds
   // slackWebhookUrl: '...'  // dev/integration only — never in production
@@ -326,12 +366,12 @@ await PushApp.initialize({
 
 | Pattern | When to use | Code |
 |---------|-------------|------|
-| **A — Native cached token (recommended)** | Ionic apps using this SDK | `PushApp.register({ fcmToken: '' })` with retry — see `example-app/src/app/pushapp-setup.ts` |
+| **A — Native cached token (recommended)** | Ionic apps using this SDK | `PushApp.register({ fcmToken: '' })` with retry — **Android and iOS** — see `example-app/src/app/pushapp-setup.ts` |
 | **B — Capacitor listener** | When you already use `@capacitor/push-notifications` listeners | Listener passes `token.value` to `register()` |
 
 #### Pattern A (recommended) — `pushapp-setup.ts`
 
-The native SDK caches the FCM/APNs token. On Android, the first launch may not have a token yet — retry until it arrives:
+The native SDK caches the FCM/APNs token. On first launch, tokens may not be ready yet — retry until they arrive (Android and iOS):
 
 ```typescript
 const REGISTER_RETRY_MS = 1000;
@@ -353,7 +393,17 @@ export async function registerDevice(fcmToken?: string): Promise<void> {
 }
 ```
 
-`register()` is safe on every app open — the SDK **skips the network call** when already registered with the same token.
+`register()` is safe on every app open. The SDK:
+
+- Avoids duplicate registration when already registered with the **same** push token
+- Updates the stored push token automatically when it changes after a successful register
+- After **`logout()`**, clears local registration state and registers again as a fresh guest device
+
+No extra JavaScript is required for token refresh after the first successful register.
+
+#### iOS note
+
+With Pattern A, `AppDelegate` **must** wire Firebase + APNs as in [§4](#4-ios-native-setup): `handleDeviceToken`, `handleFcmTokenRefresh`, and `Messaging.messaging().apnsToken`. You do **not** need to pass `apnsToken` from JavaScript — the plugin reads native cached tokens when `fcmToken` is empty.
 
 #### Pattern B — Capacitor Push Notifications
 
@@ -368,11 +418,7 @@ PushNotifications.addListener('registration', async (token) => {
 });
 ```
 
-#### iOS note
-
-With Pattern A, `AppDelegate` **must** call `PushApp.shared.handleDeviceToken(deviceToken)`. You do **not** need to pass `apnsToken` from JavaScript if native forwarding is set up.
-
-With Pattern B, pass the hex APNs token from your listener:
+On iOS with Pattern B, pass the hex APNs token from your listener:
 
 ```typescript
 await PushApp.register({ apnsToken: apnsTokenHex, fcmToken: fcmTokenOptional });
@@ -538,11 +584,11 @@ Use this before going live:
 
 - [ ] `google-services.json` (Android) and/or `GoogleService-Info.plist` (iOS) added
 - [ ] Android `google-services` Gradle plugin applied ([§3b](#3b-android-gradle-required))
-- [ ] iOS Push Notifications capability enabled
-- [ ] `AppDelegate` forwards APNs token ([§4](#4-ios-native-setup))
+- [ ] iOS Push Notifications capability enabled; `pod 'Firebase/Messaging'` in Podfile
+- [ ] `AppDelegate` wires Firebase, APNs, and FCM refresh ([§4](#4-ios-native-setup))
 - [ ] iOS notification tap handler wired ([§4b](#4b-ios-notification-open--cta-tracking))
-- [ ] `PushApp.initialize()` called at app startup with your App ID
-- [ ] `PushApp.register()` called after initialize (retry pattern on Android)
+- [ ] `PushApp.initialize()` called at app startup with channel `appId`, `pushAppId`, and `appSecretKey`
+- [ ] `PushApp.register()` called after initialize (retry pattern — Android and iOS)
 - [ ] `PushApp.login()` called after user authentication
 - [ ] `PushApp.logout()` called on sign-out
 - [ ] `saveUserData()` called after login (if using profiles/segments)
@@ -584,18 +630,14 @@ Method signatures and options are maintained in the [README API table](../README
 sequenceDiagram
     participant App
     participant SDK
-    participant Server
 
     App->>SDK: initialize()
     App->>SDK: register()
-    SDK->>Server: POST /device/register
     App->>SDK: login(userId)
-    SDK->>Server: POST /device/link
     App->>SDK: saveUserData()
     App->>SDK: setPageName() / sendEvent()
     Note over App,SDK: On sign-out
     App->>SDK: logout()
-    SDK->>Server: POST /device/delink
 ```
 
 ---
@@ -615,7 +657,11 @@ try {
       // retry — see pushapp-setup.ts
       break;
     case PushAppErrorCode.NOT_INITIALIZED:
-      await PushApp.initialize({ appId: '...' });
+      await PushApp.initialize({
+        appId: '...',
+        pushAppId: 'pa_...',
+        appSecretKey: 'pas_...',
+      });
       break;
   }
 }
