@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <application
         android:allowBackup="false"
@@ -41,6 +42,28 @@
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_channel_id"
             android:value="pushapp_channel_id" />
+
+        <!--
+          @capacitor-firebase/messaging owns FCM (io.capawesome...MessagingService).
+          Remove competing MESSAGING_EVENT filters so JS listeners receive messages
+          and can forward them to PushApp.handlePushNotification().
+        -->
+        <service
+            android:name="com.mehery.pushapp.MySdkFirebaseMessagingService"
+            android:exported="false"
+            tools:node="merge">
+            <intent-filter tools:node="remove">
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <service
+            android:name="com.capacitorjs.plugins.pushnotifications.MessagingService"
+            android:exported="false"
+            tools:node="merge">
+            <intent-filter tools:node="remove">
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
     </application>
 
     <!-- Permissions -->

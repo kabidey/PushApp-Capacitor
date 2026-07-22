@@ -19,7 +19,7 @@ object PushAppLogger {
         RegexOption.IGNORE_CASE,
     )
     private val sensitiveHeaderPattern = Regex(
-        """(?i)(authorization|x-device-id)\s*[=:]\s*\S+""",
+        """(?i)(authorization|x-device-id|x-app-id|x-app-key)\s*[=:]\s*\S+""",
     )
     private val bearerPattern = Regex("""Bearer\s+\S+""", RegexOption.IGNORE_CASE)
 

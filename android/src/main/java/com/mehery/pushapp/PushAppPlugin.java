@@ -7,6 +7,7 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import kotlin.Unit;
@@ -30,6 +31,9 @@ public class PushAppPlugin extends Plugin {
             return;
         }
 
+        String pushAppId = call.getString("pushAppId", "");
+        String appSecretKey = call.getString("appSecretKey", "");
+
         Boolean sandbox = call.getBoolean("sandbox", false);
         Boolean debugMode = call.getBoolean("debugMode", false);
         String slackWebhookUrl = call.getString("slackWebhookUrl");
@@ -41,7 +45,8 @@ public class PushAppPlugin extends Plugin {
             return;
         }
 
-        boolean initialized = PushApp.Companion.getInstance().initialize(context, appId, sandbox, slackWebhookUrl, debugMode);
+        boolean initialized = PushApp.Companion.getInstance().initialize(
+            context, appId, pushAppId, appSecretKey, sandbox, slackWebhookUrl, debugMode);
         if (!initialized) {
             rejectWithCode(call, PushAppErrorCodes.INVALID_APP_ID);
             return;
@@ -105,15 +110,16 @@ public class PushAppPlugin extends Plugin {
             return;
         }
 
-        boolean loggedIn = PushApp.Companion.getInstance().login(userId);
-        if (!loggedIn) {
-            rejectWithCode(call, PushAppErrorCodes.LOGIN_FAILED);
-            return;
-        }
-
-        JSObject ret = new JSObject();
-        ret.put("status", "logged_in");
-        call.resolve(ret);
+        PushApp.Companion.getInstance().login(userId, success -> {
+            if (Boolean.TRUE.equals(success)) {
+                JSObject ret = new JSObject();
+                ret.put("status", "logged_in");
+                call.resolve(ret);
+            } else {
+                rejectWithCode(call, PushAppErrorCodes.LOGIN_FAILED);
+            }
+            return Unit.INSTANCE;
+        });
     }
 
     // MARK: - save user data (create or update customer profile)
@@ -129,6 +135,11 @@ public class PushAppPlugin extends Plugin {
         JSObject cohorts = call.getObject("cohorts");
         if (additionalInfo == null || cohorts == null) {
             rejectWithCode(call, PushAppErrorCodes.MISSING_PROFILE_DATA);
+            return;
+        }
+
+        if (!PushApp.Companion.getInstance().isDeviceLinkCompleted()) {
+            rejectWithCode(call, PushAppErrorCodes.DEVICE_LINK_REQUIRED);
             return;
         }
 
@@ -450,6 +461,53 @@ public class PushAppPlugin extends Plugin {
 
         JSObject ret = new JSObject();
         ret.put("success", true);
+        call.resolve(ret);
+    }
+
+    /**
+     * Host-app forward path: Capacitor (or another FCM owner) received the message and
+     * hands the payload to the SDK for tray / in-app display.
+     */
+    @PluginMethod
+    public void handlePushNotification(PluginCall call) {
+        Map<String, String> data = new HashMap<>();
+        JSObject dataObj = call.getObject("data");
+        if (dataObj != null) {
+            Iterator<String> keys = dataObj.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                try {
+                    Object value = dataObj.get(key);
+                    if (value != null) {
+                        data.put(key, String.valueOf(value));
+                    }
+                } catch (Exception ignored) {
+                    // skip non-stringifiable entries
+                }
+            }
+        }
+
+        String title = call.getString("title");
+        if (title != null && !title.isEmpty() && !data.containsKey("title")) {
+            data.put("title", title);
+        }
+        String body = call.getString("body");
+        if (body != null && !body.isEmpty() && !data.containsKey("body")) {
+            data.put("body", body);
+        }
+
+        Context context = getContext();
+        PushApp pushApp = PushApp.Companion.getInstance();
+        pushApp.setLastNotificationData(data);
+
+        if (!pushApp.isInitialized()) {
+            PushNotificationDisplay.INSTANCE.displayFromData(context, data);
+        } else {
+            pushApp.handleNotification(data);
+        }
+
+        JSObject ret = new JSObject();
+        ret.put("status", "handled");
         call.resolve(ret);
     }
 

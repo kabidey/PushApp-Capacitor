@@ -10,12 +10,15 @@ import UserNotifications
 class NotificationService: UNNotificationServiceExtension {
     override func didReceive(_ request: UNNotificationRequest, withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
         let bestAttemptContent = (request.content.mutableCopy() as! UNMutableNotificationContent)
-        
+        print("[PushApp Example] RECEIVED NotificationService extension userInfo=\(request.content.userInfo)")
+        // Service extensions cannot call the main-app SDK; media attach only.
+
         if let mediaUrl = request.content.userInfo["media-url"] as? String,
            let url = URL(string: mediaUrl) {
-            
+            print("[PushApp Example] NotificationService attaching media-url=\(mediaUrl)")
             downloadAndAttachImage(url: url, content: bestAttemptContent, contentHandler: contentHandler)
         } else {
+            print("[PushApp Example] NotificationService no media-url — pass-through")
             contentHandler(bestAttemptContent)
         }
     }

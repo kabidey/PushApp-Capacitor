@@ -2,9 +2,11 @@ import UIKit
 import Capacitor
 import PushappIonic
 import UserNotifications
+import Firebase
+import FirebaseMessaging
 
 @UIApplicationMain
-class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate, MessagingDelegate {
 
     var window: UIWindow?
 
@@ -16,8 +18,27 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        FirebaseApp.configure()
+        Messaging.messaging().delegate = self
+
         UNUserNotificationCenter.current().delegate = self
         print("🔔 AppDelegate set as UNUserNotificationCenter delegate (didFinishLaunching)")
+
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error = error {
+                print("Notification permission request failed: \(error)")
+                return
+            }
+            guard granted else {
+                print("Notification permission denied")
+                return
+            }
+            DispatchQueue.main.async {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        }
+
+        fetchAndCacheFcmToken()
 
         // Re-assert delegate after bridge loads so we are not overwritten by any plugin
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -27,6 +48,29 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         }
         return true
     }
+
+    private func fetchAndCacheFcmToken() {
+        Messaging.messaging().token { token, error in
+            if let error = error {
+                print("[PushApp Example] RECEIVED FCM token fetch failed: \(error.localizedDescription)")
+                return
+            }
+            guard let token = token, !token.isEmpty else {
+                print("[PushApp Example] RECEIVED FCM token empty — skip forward")
+                return
+            }
+            let preview = String(token.prefix(12))
+            print("[PushApp Example] RECEIVED FCM token (\(preview)…)")
+            if #available(iOS 15.2, *) {
+                print("[PushApp Example] FORWARD → PushApp.handleFcmTokenRefresh")
+                PushApp.shared.handleFcmTokenRefresh(token)
+                print("[PushApp Example] FORWARD OK → PushApp.handleFcmTokenRefresh")
+            } else {
+                UserDefaults.standard.set(token, forKey: "fcm_token")
+            }
+        }
+    }
+
     func applicationWillResignActive(_ application: UIApplication) {
         // Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
         // Use this method to pause ongoing tasks, disable timers, and invalidate graphics rendering callbacks. Games should use this method to pause the game.
@@ -63,44 +107,66 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // tracking app url opens, make sure to keep this call
         return ApplicationDelegateProxy.shared.application(application, continue: userActivity, restorationHandler: restorationHandler)
     }
-  
+
     func application(_ application: UIApplication,
                      didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-      if #available(iOS 15.2, *) {
-        PushApp.shared.handleDeviceToken(deviceToken)
-      } else {
-        // Fallback on earlier versions
-      }
+        print("[PushApp Example] RECEIVED APNs device token (bytes=\(deviceToken.count))")
+        Messaging.messaging().apnsToken = deviceToken
+        if #available(iOS 15.2, *) {
+            print("[PushApp Example] FORWARD → PushApp.handleDeviceToken")
+            PushApp.shared.handleDeviceToken(deviceToken)
+            print("[PushApp Example] FORWARD OK → PushApp.handleDeviceToken")
+        } else {
+            // Fallback on earlier versions
+        }
     }
 
     func application(_ application: UIApplication,
                      didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        print("Failed to register for remote notifications: \(error)")
+        print("[PushApp Example] RECEIVED APNs registration failure: \(error)")
     }
-  
-  func application(_ application: UIApplication,
-                   didReceiveRemoteNotification userInfo: [AnyHashable: Any],
-                   fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
-      print("Received silent push:", userInfo)
 
-      if #available(iOS 15.2, *) {
-        PushApp.shared.ping()
-      } else {
-        // Fallback on earlier versions
-      }
+    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let fcmToken = fcmToken, !fcmToken.isEmpty else {
+            print("[PushApp Example] RECEIVED FCM token refresh empty — skip forward")
+            return
+        }
+        let preview = String(fcmToken.prefix(12))
+        print("[PushApp Example] RECEIVED FCM token refresh (\(preview)…)")
+        if #available(iOS 15.2, *) {
+            print("[PushApp Example] FORWARD → PushApp.handleFcmTokenRefresh")
+            PushApp.shared.handleFcmTokenRefresh(fcmToken)
+            print("[PushApp Example] FORWARD OK → PushApp.handleFcmTokenRefresh")
+        } else {
+            UserDefaults.standard.set(fcmToken, forKey: "fcm_token")
+        }
+    }
 
-      completionHandler(.newData)
-  }
-    
+    func application(_ application: UIApplication,
+                     didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        print("[PushApp Example] RECEIVED remote/silent push userInfo=\(userInfo)")
+
+        if #available(iOS 15.2, *) {
+            print("[PushApp Example] FORWARD → PushApp.ping")
+            PushApp.shared.ping()
+            print("[PushApp Example] FORWARD OK → PushApp.ping")
+        } else {
+            // Fallback on earlier versions
+        }
+
+        completionHandler(.newData)
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
-    
+
     // Called when a notification arrives while the app is in the foreground
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        print("🔔 willPresent: notification received while app in foreground")
         let userInfo = notification.request.content.userInfo
-        
+        print("[PushApp Example] RECEIVED willPresent (foreground) id=\(notification.request.identifier) userInfo=\(userInfo)")
+
         // Show notification banner even when app is in foreground
         if #available(iOS 14.0, *) {
             // iOS 14+ supports banner, sound, and badge
@@ -109,12 +175,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             // iOS 13 and below use alert instead of banner
             completionHandler([.alert, .sound, .badge])
         }
-        
+
         // Handle the notification data if needed
         if #available(iOS 15.2, *) {
             // Convert notification to dictionary format for PushApp
             var notificationData: [String: Any] = [:]
-            
+
             // Extract standard notification fields
             if let title = userInfo["title"] as? String {
                 notificationData["title"] = title
@@ -122,31 +188,29 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             if let body = userInfo["body"] as? String {
                 notificationData["body"] = body
             }
-            
+
             // Copy all userInfo data
             for (key, value) in userInfo {
               notificationData[key as! String] = value
             }
-            
-            // Handle notification through PushApp if needed
+
+            // Not forwarded today — JS FirebaseMessaging.notificationReceived owns display forwarding.
+            print("[PushApp Example] SKIP forward → PushApp.handleNotification (commented; payload prepared)=\(notificationData)")
             // PushApp.shared.handleNotification(notificationData)
         }
     }
-    
+
     // Called when user taps on a notification
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        print("🔔 didReceive: user tapped notification or CTA")
         let id = response.notification.request.identifier
-        print("📩 Received notification with ID = \(id)")
-
         let userInfo = response.notification.request.content.userInfo
         let actionId = response.actionIdentifier
-        print("🧾 userInfo:", userInfo)
+        print("[PushApp Example] RECEIVED didReceive (tap/CTA) id=\(id) actionId=\(actionId) userInfo=\(userInfo)")
 
         guard let token = userInfo["click_token"] as? String else {
-            print("❌ Missing click_token in payload")
+            print("[PushApp Example] SKIP forward — missing click_token in payload")
             completionHandler()
             return
         }
@@ -163,6 +227,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
                 if let urlString = matchingButton["url"] as? String,
                    let url = URL(string: urlString),
                    UIApplication.shared.canOpenURL(url) {
+                    print("[PushApp Example] Opening CTA url=\(urlString)")
                     UIApplication.shared.open(url, options: [:], completionHandler: nil)
                 }
             }
@@ -170,11 +235,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         // Track the event (opened or CTA)
         if #available(iOS 15.2, *) {
+            print("[PushApp Example] FORWARD → PushApp.trackPushNotificationEvent event=\(event) ctaId=\(ctaId ?? "nil")")
             PushApp.shared.trackPushNotificationEvent(token: token, event: event, ctaId: ctaId) { success in
                 if success {
-                    print("✅ Push track (\(event)) sent successfully.")
+                    print("[PushApp Example] FORWARD OK → PushApp.trackPushNotificationEvent (\(event))")
                 } else {
-                    print("❌ Failed to send push track (\(event)).")
+                    print("[PushApp Example] FORWARD FAIL → PushApp.trackPushNotificationEvent (\(event))")
                 }
             }
         }

@@ -14,7 +14,7 @@ enum PushAppLogger {
     private static let sensitiveJsonKeyPattern =
         #""(token|fcm_token|apns_token|user_id|device_id|guest_id|channel_id|code|password|email|phone|authorization)"\s*:\s*"[^"]*""#
     private static let sensitiveHeaderPattern =
-        #"(?i)(authorization|x-device-id)\s*[=:]\s*\S+"#
+        #"(?i)(authorization|x-device-id|x-app-id|x-app-key)\s*[=:]\s*\S+"#
     private static let bearerPattern = #"Bearer\s+\S+"#
 
     private static var level: Level = .error

@@ -15,6 +15,8 @@ public class PushApp: NSObject {
     private var guestId: String?
     internal var tenant: String = ""
     private var channelId: String = ""
+    private var pushAppId: String = ""
+    private var appSecretKey: String = ""
     private var socketManager: WebSocketManager?
     private var inAppDisplay: InAppDisplay?
     private var currentContext: UIViewController?
@@ -33,9 +35,26 @@ public class PushApp: NSObject {
     private var lifecycleState: SdkLifecycle = .notInitialized
     private var lastAppOpenSentAt: TimeInterval = 0
     private var didRegisterForegroundObserver = false
+    private var deviceLinkCompleted = false
+    private var lastSuccessfulProfileRequestFingerprint: String?
 
     private static let appOpenDebounceSeconds: TimeInterval = 3
+    private static let inAppPollDelaySeconds: TimeInterval = 2
+    private static let registerMaxAttempts = 3
+    private static let registerRetryDelaySeconds: TimeInterval = 1
     private static let guestIdKey = "pushapp_guest_id"
+    private static let deviceLinkedKey = "pushapp_device_linked"
+    private static let appInstallSentKey = "pushapp_app_install_sent"
+    private static let syncedApnsTokenKey = "pushapp_synced_apns_token"
+    private static let syncedFcmTokenKey = "pushapp_synced_fcm_token"
+    private static let sdkFramework = "ionic"
+    private static let sdkVersion: String = {
+        let bundle = Bundle(for: PushAppPlugin.self)
+        if let version = bundle.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
+            return version
+        }
+        return "0.1.2"
+    }()
 
     private override init() {
         super.init()
@@ -43,6 +62,8 @@ public class PushApp: NSObject {
 
     public func initialize(
         appId: String,
+        pushAppId: String = "",
+        appSecretKey: String = "",
         sandbox: Bool = false,
         slackWebhookUrl: String? = nil,
         debugMode: Bool = false
@@ -50,6 +71,8 @@ public class PushApp: NSObject {
         self.sandbox = sandbox
         PushAppLogger.configure(debug: debugMode)
         SlackApiLogger.configure(webhookUrl: slackWebhookUrl)
+        self.pushAppId = pushAppId
+        self.appSecretKey = appSecretKey
         guard let context = self.topViewController() else {
             slackPrint("Initialize failed: unable to find top view controller")
             lifecycleState = .notInitialized
@@ -85,6 +108,13 @@ public class PushApp: NSObject {
         if let savedUserId = UserDefaults.standard.string(forKey: "pushapp_user_id"), !savedUserId.isEmpty {
             self.slackPrint("Restored userId from storage")
             self.userId = savedUserId
+            let defaults = UserDefaults.standard
+            if defaults.object(forKey: Self.deviceLinkedKey) != nil {
+                deviceLinkCompleted = defaults.bool(forKey: Self.deviceLinkedKey)
+            } else {
+                // Legacy installs persisted userId only after a successful device link.
+                deviceLinkCompleted = true
+            }
         }
 
         if UserDefaults.standard.bool(forKey: "pushapp_registered") {
@@ -115,6 +145,17 @@ public class PushApp: NSObject {
 
         slackPrint("Sending app_open event")
         sendEvent(eventName: "app_open", eventData: ["compare": channelId])
+    }
+
+    /** Sent once per device when `/pushapp/api/device/register` succeeds for the first time. */
+    private func notifyAppInstall() {
+        guard lifecycleState == .registered || lifecycleState == .loggedIn else { return }
+        guard userId != nil || guestId != nil else { return }
+        guard !UserDefaults.standard.bool(forKey: Self.appInstallSentKey) else { return }
+
+        UserDefaults.standard.set(true, forKey: Self.appInstallSentKey)
+        slackPrint("Sending app_install event")
+        sendEvent(eventName: "app_install", eventData: ["compare": channelId])
     }
 
     private func restoreGuestIdFromStorage() {
@@ -154,6 +195,13 @@ public class PushApp: NSObject {
     }
 
     public var isInitialized: Bool { lifecycleState != .notInitialized }
+
+    public func isDeviceLinkCompleted() -> Bool { deviceLinkCompleted }
+
+    private func setDeviceLinkCompleted(_ linked: Bool) {
+        deviceLinkCompleted = linked
+        UserDefaults.standard.set(linked, forKey: Self.deviceLinkedKey)
+    }
 
     // Inside PushApp class
 
@@ -333,6 +381,16 @@ private func clipPlaceholderRect(
         headers["X-App-Version"] = appVersion
         headers["X-Build-Number"] = buildNumber
 
+        if !pushAppId.isEmpty {
+            headers["x-app-id"] = pushAppId
+        }
+        if !appSecretKey.isEmpty {
+            headers["x-app-key"] = appSecretKey
+        }
+
+        headers["sdk_framework"] = Self.sdkFramework
+        headers["sdk_version"] = Self.sdkVersion
+
         return headers
     }
 
@@ -373,8 +431,159 @@ private func clipPlaceholderRect(
             )
             return
         }
-        if UserDefaults.standard.bool(forKey: "pushapp_registered") {
-            self.slackPrint("Device already registered — token cached locally")
+
+        let fcmToken = defaults.string(forKey: "fcm_token")
+        if defaults.bool(forKey: "pushapp_registered") {
+            handlePushTokenAfterRegister(apnsToken: tokenString, fcmToken: fcmToken, completion: nil)
+        }
+    }
+
+    /// Call when FCM token refreshes on iOS (e.g. from Firebase). Uses update API if already registered.
+    public func handleFcmTokenRefresh(_ fcmToken: String) {
+        PushAppLogger.logPushToken("FCM token (refresh)", token: fcmToken)
+        let defaults = UserDefaults.standard
+        defaults.set(fcmToken, forKey: "fcm_token")
+        guard defaults.bool(forKey: "pushapp_registered") else { return }
+        let apnsToken = defaults.string(forKey: "apns_token") ?? ""
+        guard !apnsToken.isEmpty else { return }
+        handlePushTokenAfterRegister(apnsToken: apnsToken, fcmToken: fcmToken, completion: nil)
+    }
+
+    private func tokenContactId() -> String? {
+        guard let guest = guestId, !guest.isEmpty else { return nil }
+        guard let deviceId = getPersistentDeviceId() as String?, !deviceId.isEmpty else { return nil }
+        return "\(guest)_\(deviceId)"
+    }
+
+    private func syncedApnsToken() -> String? {
+        let defaults = UserDefaults.standard
+        if let synced = defaults.string(forKey: Self.syncedApnsTokenKey), !synced.isEmpty {
+            return synced
+        }
+        if defaults.bool(forKey: "pushapp_registered"),
+           let legacy = defaults.string(forKey: "apns_token"), !legacy.isEmpty {
+            return legacy
+        }
+        return nil
+    }
+
+    private func syncedFcmToken() -> String {
+        let defaults = UserDefaults.standard
+        if let synced = defaults.string(forKey: Self.syncedFcmTokenKey) {
+            return synced
+        }
+        if defaults.bool(forKey: "pushapp_registered") {
+            return defaults.string(forKey: "fcm_token") ?? ""
+        }
+        return ""
+    }
+
+    private func pushTokensChanged(apnsToken: String, fcmToken: String?) -> Bool {
+        let incomingFcm = fcmToken ?? ""
+        return apnsToken != (syncedApnsToken() ?? "") || incomingFcm != syncedFcmToken()
+    }
+
+    private func setSyncedPushTokens(apnsToken: String, fcmToken: String?) {
+        let defaults = UserDefaults.standard
+        defaults.set(apnsToken, forKey: Self.syncedApnsTokenKey)
+        defaults.set(fcmToken ?? "", forKey: Self.syncedFcmTokenKey)
+        defaults.set(apnsToken, forKey: "apns_token")
+        if let fcmToken, !fcmToken.isEmpty {
+            defaults.set(fcmToken, forKey: "fcm_token")
+        }
+    }
+
+    /**
+     * After successful register: if tokens differ from last sync, POST /pushapp/api/update/token.
+     * Never calls register again when the device is already registered.
+     */
+    private func handlePushTokenAfterRegister(
+        apnsToken: String,
+        fcmToken: String?,
+        completion: ((Bool) -> Void)?
+    ) {
+        guard UserDefaults.standard.bool(forKey: "pushapp_registered") else {
+            DispatchQueue.main.async { completion?(false) }
+            return
+        }
+
+        if !pushTokensChanged(apnsToken: apnsToken, fcmToken: fcmToken) {
+            slackPrint("Push token unchanged from last sync — skipping update API")
+            DispatchQueue.main.async { completion?(true) }
+            return
+        }
+
+        guard let contactId = tokenContactId() else {
+            PushAppLogger.error("Cannot update push token: guestId missing (complete register first)")
+            DispatchQueue.main.async { completion?(false) }
+            return
+        }
+
+        slackPrint("Push token changed — calling update API")
+        updatePushTokenOnServer(token: apnsToken, contactId: contactId) { success in
+            if success {
+                self.setSyncedPushTokens(apnsToken: apnsToken, fcmToken: fcmToken)
+            }
+            completion?(success)
+        }
+    }
+
+    private func updatePushTokenOnServer(
+        token: String,
+        contactId: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard UserDefaults.standard.bool(forKey: "pushapp_registered") else {
+            completion(false)
+            return
+        }
+
+        let urlString = "\(serverUrl)/pushapp/api/update/token"
+        guard let url = URL(string: urlString) else {
+            completion(false)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let deviceHeaders = getDeviceHeaders()
+        for (key, value) in deviceHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        let payload: [String: Any] = [
+            "contact_id": contactId,
+            "token": token,
+            "channel_id": channelId,
+        ]
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else {
+            completion(false)
+            return
+        }
+        request.httpBody = jsonData
+
+        slackPrint("Update token URL: \(urlString)")
+        if let jsonString = String(data: jsonData, encoding: .utf8) {
+            slackPrint("Update token payload: \(jsonString)")
+        }
+
+        SlackApiLogger.dataTask(with: request) { _, response, error in
+            if let error = error {
+                self.slackPrint("Update token request failed: \(error.localizedDescription)")
+                completion(false)
+                return
+            }
+            let success: Bool
+            if let httpResponse = response as? HTTPURLResponse {
+                success = (200..<300).contains(httpResponse.statusCode)
+                self.slackPrint("Update token response status: \(httpResponse.statusCode)")
+            } else {
+                success = false
+            }
+            completion(success)
         }
     }
 
@@ -397,28 +606,29 @@ private func clipPlaceholderRect(
         }
         let defaults = UserDefaults.standard
         if defaults.bool(forKey: "pushapp_registered") {
-            let savedApnsToken = defaults.string(forKey: "apns_token")
-            let savedFcmToken = defaults.string(forKey: "fcm_token")
-            let incomingFcmToken = fcmToken ?? ""
-            let savedFcm = savedFcmToken ?? ""
-            if savedApnsToken == apnsToken && savedFcm == incomingFcmToken {
-                slackPrint("Device already registered with same token — skipping register API")
-                if lifecycleState == .initialized {
-                    lifecycleState = .registered
-                }
-                if guestId == nil {
-                    restoreGuestIdFromStorage()
-                }
-                notifyAppOpen()
-                DispatchQueue.main.async { completion(true) }
-                return
+            if lifecycleState == .initialized {
+                lifecycleState = .registered
             }
-            slackPrint("Push token changed — re-registering device")
+            if guestId == nil {
+                restoreGuestIdFromStorage()
+            }
+            handlePushTokenAfterRegister(apnsToken: apnsToken, fcmToken: fcmToken) { success in
+                if success {
+                    self.notifyAppOpen()
+                }
+                completion(success)
+            }
+            return
         }
         sendTokenToServer(token: apnsToken, fcmToken: fcmToken, completion: completion)
     }
 
-    private func sendTokenToServer(token: String, fcmToken: String? = nil, completion: ((Bool) -> Void)? = nil) {
+    private func sendTokenToServer(
+        token: String,
+        fcmToken: String? = nil,
+        completion: ((Bool) -> Void)? = nil,
+        attempt: Int = 1
+    ) {
         guard let deviceId = getPersistentDeviceId() as String? else {
             self.slackPrint("❌ Failed to get deviceId")
             if let completion = completion {
@@ -440,7 +650,6 @@ private func clipPlaceholderRect(
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // Attach device headers
         let deviceHeaders = getDeviceHeaders()
         for (key, value) in deviceHeaders {
             request.setValue(value, forHTTPHeaderField: key)
@@ -464,13 +673,28 @@ private func clipPlaceholderRect(
             }
             return
         }
-        self.slackPrint("📤 Sending Token Request: \(urlString)")
+        self.slackPrint("📤 Sending Token Request: \(urlString) (attempt \(attempt)/\(Self.registerMaxAttempts))")
         self.slackPrint("📦 Payload: \(jsonString)")
         request.httpBody = jsonData
 
         SlackApiLogger.dataTask(with: request) { data, response, error in
             if let error = error {
-                self.slackPrint("❌ Token send failed: \(error.localizedDescription)")
+                if attempt < Self.registerMaxAttempts {
+                    self.slackPrint(
+                        "Register API failed (attempt \(attempt)/\(Self.registerMaxAttempts)): " +
+                        "\(error.localizedDescription) — retrying"
+                    )
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.registerRetryDelaySeconds) {
+                        self.sendTokenToServer(
+                            token: token,
+                            fcmToken: fcmToken,
+                            completion: completion,
+                            attempt: attempt + 1
+                        )
+                    }
+                    return
+                }
+                self.slackPrint("❌ Register API failed after \(Self.registerMaxAttempts) attempts: \(error.localizedDescription)")
                 if let completion = completion {
                     DispatchQueue.main.async { completion(false) }
                 }
@@ -482,100 +706,120 @@ private func clipPlaceholderRect(
                 self.slackPrint("🌐 Headers: \(httpResponse.allHeaderFields)")
             }
 
-            guard let data = data else {
-                self.slackPrint("❌ No response data received")
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let httpOk = (200..<300).contains(status)
+
+            if httpOk {
+                if let data = data, let rawString = String(data: data, encoding: .utf8) {
+                    self.slackPrint("📥 Raw Response: \(rawString)")
+                }
+
+                do {
+                    if let data = data {
+                        let json = try JSONSerialization.jsonObject(with: data, options: [.allowFragments])
+                        self.slackPrint("✅ Parsed JSON: \(json)")
+
+                        if let responseDict = json as? [String: Any],
+                           let device = responseDict["device"] as? [String: Any],
+                           let guest = device["user_id"] as? String {
+                            let defaults = UserDefaults.standard
+                            defaults.set(token, forKey: "apns_token")
+                            persistGuestId(guest)
+                            self.slackPrint("🎉 Guest ID set: \(guest)")
+                        } else {
+                            self.slackPrint("⚠️ JSON structure did not match expected format")
+                        }
+                    }
+                } catch {
+                    self.slackPrint("❌ Token send JSON parse error: \(error)")
+                }
+
+                let defaults = UserDefaults.standard
+                defaults.set(true, forKey: "pushapp_registered")
+                self.setSyncedPushTokens(apnsToken: token, fcmToken: fcmToken)
+                self.lifecycleState = .registered
+                self.slackPrint("SDK registered — next: call login()")
+                self.notifyAppInstall()
+                self.notifyAppOpen()
+
                 if let completion = completion {
-                    DispatchQueue.main.async { completion(false) }
+                    DispatchQueue.main.async { completion(true) }
                 }
                 return
             }
 
-            if let rawString = String(data: data, encoding: .utf8) {
+            if let data = data, let rawString = String(data: data, encoding: .utf8) {
                 self.slackPrint("📥 Raw Response: \(rawString)")
+            } else if data == nil {
+                self.slackPrint("❌ No response data received")
             }
+            self.slackPrint("❌ Register API failed: HTTP \(status)")
 
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let httpOk = (200..<300).contains(status)
-
-            do {
-                let json = try JSONSerialization.jsonObject(with: data, options: [.allowFragments])
-                self.slackPrint("✅ Parsed JSON: \(json)")
-
-                if let responseDict = json as? [String: Any],
-                   let device = responseDict["device"] as? [String: Any],
-                   let guest = device["user_id"] as? String {
-                    let defaults = UserDefaults.standard
-                    defaults.set(token, forKey: "apns_token")
-                    persistGuestId(guest)
-                    self.slackPrint("🎉 Guest ID set: \(guest)")
-                } else {
-                    self.slackPrint("⚠️ JSON structure did not match expected format")
+            if attempt < Self.registerMaxAttempts {
+                self.slackPrint("Register API failed (attempt \(attempt)/\(Self.registerMaxAttempts)) — retrying")
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.registerRetryDelaySeconds) {
+                    self.sendTokenToServer(
+                        token: token,
+                        fcmToken: fcmToken,
+                        completion: completion,
+                        attempt: attempt + 1
+                    )
                 }
-            } catch {
-                self.slackPrint("❌ Token send JSON parse error: \(error)")
+                return
             }
 
+            self.slackPrint("❌ Register API failed after \(Self.registerMaxAttempts) attempts")
             if let completion = completion {
-                DispatchQueue.main.async {
-                    if httpOk {
-                        let defaults = UserDefaults.standard
-                        defaults.set(true, forKey: "pushapp_registered")
-                        defaults.set(token, forKey: "apns_token")
-                        if let fcmToken = fcmToken, !fcmToken.isEmpty {
-                            defaults.set(fcmToken, forKey: "fcm_token")
-                        }
-                        self.lifecycleState = .registered
-                        self.slackPrint("SDK registered — next: call login()")
-                        self.notifyAppOpen()
-                    }
-                    completion(httpOk)
-                }
+                DispatchQueue.main.async { completion(false) }
             }
         }
     }
 
 
-    @discardableResult
-    public func login(userId: String) -> Bool {
+    /// Links the device to `userId`. Completion is called on the main queue when
+    /// `/pushapp/api/device/link` finishes — only then is `isDeviceLinkCompleted()` true.
+    public func login(userId: String, completion: @escaping (Bool) -> Void) {
         if lifecycleState == .notInitialized || serverUrl.isEmpty {
             logSequenceError("login() requires initialize() first")
-            return false
+            DispatchQueue.main.async { completion(false) }
+            return
         }
         if lifecycleState == .initialized {
             logSequenceError("login() requires register() first")
-            return false
+            DispatchQueue.main.async { completion(false) }
+            return
         }
         if userId.isEmpty {
             slackPrint("login() failed: userId is empty")
-            return false
+            DispatchQueue.main.async { completion(false) }
+            return
         }
 
         self.slackPrint("🔑 Starting login for user: \(userId)")
 
         self.userId = userId
         lifecycleState = .loggedIn
-        UserDefaults.standard.setValue(userId, forKey: "pushapp_user_id")
-        self.slackPrint("💾 Saved userId in UserDefaults")
-
-        connectSocket()
-        self.slackPrint("🔌 Socket connection initiated")
+        setDeviceLinkCompleted(false)
 
         guard let deviceId = getPersistentDeviceId() as String? else {
             self.slackPrint("❌ Failed to get deviceId")
-            return false
+            revertFailedLogin()
+            DispatchQueue.main.async { completion(false) }
+            return
         }
 
         let urlString = "\(serverUrl)/pushapp/api/device/link"
         guard let url = URL(string: urlString) else {
             self.slackPrint("❌ Invalid URL: \(urlString)")
-            return false
+            revertFailedLogin()
+            DispatchQueue.main.async { completion(false) }
+            return
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // Attach device headers
         let deviceHeaders = getDeviceHeaders()
         for (key, value) in deviceHeaders {
             request.setValue(value, forHTTPHeaderField: key)
@@ -585,7 +829,7 @@ private func clipPlaceholderRect(
         let payload: [String: Any] = [
             "user_id": userId,
             "device_id": deviceId,
-            "channel_id": channelId
+            "channel_id": channelId,
         ]
 
         if let jsonData = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted),
@@ -595,37 +839,51 @@ private func clipPlaceholderRect(
             request.httpBody = jsonData
         } else {
             self.slackPrint("❌ Failed to serialize login payload")
-            return false
+            revertFailedLogin()
+            DispatchQueue.main.async { completion(false) }
+            return
         }
 
         SlackApiLogger.dataTask(with: request) { data, response, error in
             if let error = error {
                 self.slackPrint("❌ Login request failed: \(error.localizedDescription)")
+                self.revertFailedLogin()
+                DispatchQueue.main.async { completion(false) }
                 return
             }
+
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let httpOk = (200..<300).contains(status)
 
             if let httpResponse = response as? HTTPURLResponse {
                 self.slackPrint("🌐 Login Response Status: \(httpResponse.statusCode)")
                 self.slackPrint("🌐 Headers: \(httpResponse.allHeaderFields)")
             }
 
-            guard let data = data else {
-                self.slackPrint("❌ No response data received for login")
-                return
-            }
-
-            if let rawString = String(data: data, encoding: .utf8) {
+            if let data = data, let rawString = String(data: data, encoding: .utf8) {
                 self.slackPrint("📥 Raw Login Response: \(rawString)")
             }
 
-            do {
-                let json = try JSONSerialization.jsonObject(with: data, options: [.allowFragments])
-                self.slackPrint("✅ Parsed Login JSON: \(json)")
-            } catch {
-                self.slackPrint("❌ Login JSON parse error: \(error)")
+            if httpOk {
+                UserDefaults.standard.setValue(userId, forKey: "pushapp_user_id")
+                self.setDeviceLinkCompleted(true)
+                self.slackPrint("💾 Device link succeeded; userId saved")
+                self.connectSocket()
+                self.slackPrint("🔌 Socket connection initiated")
+                DispatchQueue.main.async { completion(true) }
+            } else {
+                self.revertFailedLogin()
+                PushAppLogger.error("Login API failed: HTTP \(status)")
+                DispatchQueue.main.async { completion(false) }
             }
         }
-        return true
+    }
+
+    private func revertFailedLogin() {
+        userId = nil
+        setDeviceLinkCompleted(false)
+        UserDefaults.standard.removeObject(forKey: "pushapp_user_id")
+        lifecycleState = UserDefaults.standard.bool(forKey: "pushapp_registered") ? .registered : .initialized
     }
 
     public func logout(completion: @escaping (Bool) -> Void) {
@@ -681,20 +939,49 @@ private func clipPlaceholderRect(
                 completion(false)
                 return
             }
+            let success: Bool
             if let httpResponse = response as? HTTPURLResponse {
-                completion(httpResponse.statusCode >= 200 && httpResponse.statusCode < 300)
+                success = httpResponse.statusCode >= 200 && httpResponse.statusCode < 300
             } else {
-                completion(false)
+                success = false
             }
+            if success {
+                self.reregisterDeviceAfterDelink()
+            }
+            completion(success)
         }
     }
 
     private func clearLocalUserSession() {
         userId = nil
+        setDeviceLinkCompleted(false)
+        lastSuccessfulProfileRequestFingerprint = nil
         socketManager?.disconnect()
         socketManager = nil
         UserDefaults.standard.removeObject(forKey: "pushapp_user_id")
         lifecycleState = UserDefaults.standard.bool(forKey: "pushapp_registered") ? .registered : .initialized
+    }
+
+    private func clearRegisteredState() {
+        UserDefaults.standard.set(false, forKey: "pushapp_registered")
+        UserDefaults.standard.removeObject(forKey: Self.syncedApnsTokenKey)
+        UserDefaults.standard.removeObject(forKey: Self.syncedFcmTokenKey)
+        persistGuestId(nil)
+        lifecycleState = .initialized
+    }
+
+    /** After successful device delink, register again as a fresh guest device. */
+    private func reregisterDeviceAfterDelink() {
+        let defaults = UserDefaults.standard
+        let apnsToken = defaults.string(forKey: "apns_token")
+        let fcmToken = defaults.string(forKey: "fcm_token")
+        clearRegisteredState()
+        guard let apnsToken, !apnsToken.isEmpty else {
+            slackPrint("Cannot re-register after delink: no cached APNs token")
+            return
+        }
+        slackPrint("Delink complete — re-registering device")
+        sendTokenToServer(token: apnsToken, fcmToken: fcmToken, completion: nil)
     }
 
     public func ping() {
@@ -774,12 +1061,30 @@ private func clipPlaceholderRect(
     }
 
 
-    /// Creates or updates customer profile (PUT). Call after login with the same `code` your app uses (e.g. userId_deviceId).
+    /// Creates or updates customer profile (PUT). Call after login with `code` = userId.
     /// - Parameters:
-    ///   - code: Customer code (e.g. userId_deviceId), required by the API.
+    ///   - code: Customer code (userId), required by the API.
     ///   - cohorts: Free JSON for cohort data.
     ///   - additionalInfo: Free JSON for additional profile data.
     ///   - completion: Called on main thread with success true if status 2xx, else false.
+    private func profileRequestFingerprint(
+        code: String,
+        cohorts: [String: Any],
+        additionalInfo: [String: Any]
+    ) -> String? {
+        let payload: [String: Any] = [
+            "code": code,
+            "additionalInfo": additionalInfo,
+            "cohorts": cohorts,
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
     public func updateCustomerProfile(
         code: String,
         cohorts: [String: Any],
@@ -789,6 +1094,21 @@ private func clipPlaceholderRect(
         guard !code.isEmpty else {
             self.slackPrint("❌ code is required for customer profile")
             DispatchQueue.main.async { completion?(false) }
+            return
+        }
+        guard deviceLinkCompleted else {
+            PushAppLogger.error(
+                "saveUserData() requires successful login() / device link. " +
+                    "Call login() and wait for /pushapp/api/device/link to succeed."
+            )
+            DispatchQueue.main.async { completion?(false) }
+            return
+        }
+
+        let fingerprint = profileRequestFingerprint(code: code, cohorts: cohorts, additionalInfo: additionalInfo)
+        if let fingerprint, fingerprint == lastSuccessfulProfileRequestFingerprint {
+            slackPrint("Customer profile unchanged — skipping duplicate PUT")
+            DispatchQueue.main.async { completion?(true) }
             return
         }
 
@@ -841,6 +1161,8 @@ private func clipPlaceholderRect(
                 success = (200..<300).contains(httpResponse.statusCode)
                 if !success, let data = data, let raw = String(data: data, encoding: .utf8) {
                     self.slackPrint("❌ Profile response body: \(raw)")
+                } else if success, let fingerprint {
+                    self.lastSuccessfulProfileRequestFingerprint = fingerprint
                 }
             } else {
                 success = false
@@ -915,16 +1237,6 @@ private func clipPlaceholderRect(
             return
         }
 
-        // Poll in-app notifications after 2 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            if let savedUserId = UserDefaults.standard.string(forKey: "pushapp_user_id") {
-                self.slackPrint("⏱ Polling in-app notifications for userId: \(savedUserId)")
-                self.pollForInApp(userId: savedUserId)
-            } else {
-                self.slackPrint("❌ No saved userId for in-app polling")
-            }
-        }
-
         SlackApiLogger.dataTask(with: request) { data, response, error in
             if let error = error {
                 self.slackPrint("❌ Event request failed: \(error.localizedDescription)")
@@ -945,12 +1257,28 @@ private func clipPlaceholderRect(
                 self.slackPrint("📥 Raw Event Response: \(rawString)")
             }
 
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let httpOk = (200..<300).contains(status)
+
             do {
                 let json = try JSONSerialization.jsonObject(with: data, options: [.allowFragments])
                 self.slackPrint("✅ Parsed Event JSON: \(json)")
             } catch {
                 self.slackPrint("❌ Event JSON parse error: \(error)")
             }
+
+            if httpOk {
+                self.scheduleInAppPollAfterEvent()
+            }
+        }
+    }
+
+    /// Schedules in-app poll using logged-in `userId` or pre-login `guestId` as `contact_id` prefix.
+    private func scheduleInAppPollAfterEvent() {
+        guard let contactUserId = userId ?? guestId else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.inAppPollDelaySeconds) {
+            self.slackPrint("⏱ Polling in-app notifications for contact userId: \(contactUserId)")
+            self.pollForInApp(userId: contactUserId)
         }
     }
 

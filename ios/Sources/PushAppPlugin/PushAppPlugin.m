@@ -19,4 +19,5 @@ CAP_PLUGIN(PushAppPlugin, "PushApp",
            CAP_PLUGIN_METHOD(registerTooltipTarget, CAPPluginReturnPromise); // ⭐️ ADD THIS
            CAP_PLUGIN_METHOD(unregisterTooltipTarget, CAPPluginReturnPromise); // ⭐️ ADD THIS
            CAP_PLUGIN_METHOD(trackPushNotificationEvent, CAPPluginReturnPromise);
+           CAP_PLUGIN_METHOD(handlePushNotification, CAPPluginReturnPromise);
 )

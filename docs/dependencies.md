@@ -1,6 +1,6 @@
 # Dependency inventory (SBOM summary)
 
-Runtime dependencies shipped with or required by **pushapp-ionic@0.1.2**.  
+Runtime dependencies shipped with or required by **pushapp-ionic@0.2.0**.  
 Regenerate audit hints with: `npm run audit:deps`
 
 ## npm package

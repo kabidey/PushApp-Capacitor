@@ -13,6 +13,7 @@ class PushAppErrorCodesTests: XCTestCase {
         PushAppErrorCodes.registerFailed,
         PushAppErrorCodes.emptyUserId,
         PushAppErrorCodes.loginFailed,
+        PushAppErrorCodes.deviceLinkRequired,
         PushAppErrorCodes.logoutFailed,
         PushAppErrorCodes.customerProfileFailed,
         PushAppErrorCodes.missingCode,

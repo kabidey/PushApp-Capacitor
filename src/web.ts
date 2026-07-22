@@ -9,7 +9,23 @@ interface TargetRegistrationOptions extends UIOptions {
 
 export class PushAppWeb extends WebPlugin implements PushAppPlugin {
   async initialize(
-    options: { appId: string; sandbox?: boolean } | { identifier: string; sandbox?: boolean },
+    options:
+      | {
+          appId: string;
+          pushAppId?: string;
+          appSecretKey?: string;
+          sandbox?: boolean;
+          debugMode?: boolean;
+          slackWebhookUrl?: string;
+        }
+      | {
+          identifier: string;
+          pushAppId?: string;
+          appSecretKey?: string;
+          sandbox?: boolean;
+          debugMode?: boolean;
+          slackWebhookUrl?: string;
+        },
   ): Promise<{ status: string }> {
     console.log('Web implementation - initialize', options);
     return { status: 'web_not_supported' };
@@ -94,5 +110,14 @@ export class PushAppWeb extends WebPlugin implements PushAppPlugin {
   }): Promise<{ success: boolean }> {
     console.log('Web implementation - trackPushNotificationEvent', options);
     return { success: false };
+  }
+
+  async handlePushNotification(options: {
+    title?: string;
+    body?: string;
+    data?: Record<string, unknown>;
+  }): Promise<{ status: string }> {
+    console.log('Web implementation - handlePushNotification', options);
+    return { status: 'web_not_supported' };
   }
 }

@@ -41,6 +41,8 @@ class PushApp private constructor() {
     private var sandbox: Boolean = false
     private var tenant: String = ""
     private var channelId: String = ""
+    private var pushAppId: String = ""
+    private var appSecretKey: String = ""
     private var userId: String? = null
     private var guestId: String? = null
 
@@ -50,6 +52,8 @@ class PushApp private constructor() {
     private var webSocketManager: WebSocketManager? = null
     private var currentActivityRef: WeakReference<Activity>? = null
     private var lastAppOpenSentAt = 0L
+    private var deviceLinkCompleted = false
+    private var lastSuccessfulProfileRequestFingerprint: String? = null
 
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -59,7 +63,13 @@ class PushApp private constructor() {
 
     companion object {
         private const val APP_OPEN_DEBOUNCE_MS = 3000L
+        private const val IN_APP_POLL_DELAY_MS = 2000L
+        private const val REGISTER_MAX_ATTEMPTS = 3
+        private const val REGISTER_RETRY_DELAY_MS = 1000L
         private const val PREF_GUEST_ID = "pushapp_guest_id"
+        private const val PREF_DEVICE_LINKED = "pushapp_device_linked"
+        private const val PREF_APP_INSTALL_SENT = "pushapp_app_install_sent"
+        private const val PREF_SYNCED_PUSH_TOKEN = "pushapp_synced_push_token"
 
         @Volatile
         private var instance: PushApp? = null
@@ -73,14 +83,18 @@ class PushApp private constructor() {
     fun initialize(
         context: Context,
         appId: String,
+        pushAppId: String = "",
+        appSecretKey: String = "",
         sandbox: Boolean = false,
         slackWebhookUrl: String? = null,
         debugMode: Boolean = false,
     ): Boolean {
         PushAppLogger.configure(debugMode)
         SlackApiLogger.configure(slackWebhookUrl)
+        this.pushAppId = pushAppId
+        this.appSecretKey = appSecretKey
         if (initialized) {
-            PushAppLogger.debug("PushApp", "Already initialized; updated logging config")
+            PushAppLogger.debug("PushApp", "Already initialized; updated API credentials and logging config")
             return lifecycleState != SdkLifecycle.NOT_INITIALIZED
         }
 
@@ -142,6 +156,11 @@ class PushApp private constructor() {
         val savedUserId = prefs.getString("pushapp_user_id", null)
         if (!savedUserId.isNullOrEmpty()) {
             this.userId = savedUserId
+            deviceLinkCompleted = if (prefs.contains(PREF_DEVICE_LINKED)) {
+                prefs.getBoolean(PREF_DEVICE_LINKED, false)
+            } else {
+                true // legacy: userId was only persisted after a successful device link
+            }
             PushAppLogger.debug("PushApp", "Restored userId from storage")
         }
 
@@ -199,6 +218,31 @@ class PushApp private constructor() {
         sendEvent("app_open", mapOf("compare" to channelId))
     }
 
+    private fun hasAppInstallSent(): Boolean {
+        if (!::context.isInitialized) return false
+        return context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE)
+            .getBoolean(PREF_APP_INSTALL_SENT, false)
+    }
+
+    private fun setAppInstallSent() {
+        if (!::context.isInitialized) return
+        context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_APP_INSTALL_SENT, true)
+            .apply()
+    }
+
+    /** Sent once per device when `/pushapp/api/device/register` succeeds for the first time. */
+    private fun notifyAppInstall() {
+        if (!initialized || serverUrl.isEmpty()) return
+        if (hasAppInstallSent()) return
+        if (userId == null && guestId == null) return
+
+        setAppInstallSent()
+        PushAppLogger.debug("PushApp", "Sending app_install event")
+        sendEvent("app_install", mapOf("compare" to channelId))
+    }
+
     private fun persistGuestId(guest: String?) {
         guestId = guest?.takeIf { it.isNotEmpty() }
         val editor = context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE).edit()
@@ -218,6 +262,17 @@ class PushApp private constructor() {
         )
     }
 
+    fun isDeviceLinkCompleted(): Boolean = deviceLinkCompleted
+
+    private fun setDeviceLinkCompleted(linked: Boolean) {
+        deviceLinkCompleted = linked
+        if (!::context.isInitialized) return
+        context.getSharedPreferences("PushAppPrefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_DEVICE_LINKED, linked)
+            .apply()
+    }
+
     fun isInitialized(): Boolean = lifecycleState != SdkLifecycle.NOT_INITIALIZED
 
     // ------------------ Persistent Device ID ------------------
@@ -232,6 +287,38 @@ class PushApp private constructor() {
             })
         }
         return j
+    }
+
+    private fun mapToCanonicalJsonObject(map: Map<String, Any>): JSONObject {
+        val j = JSONObject()
+        map.keys.sorted().forEach { key ->
+            j.put(key, valueToCanonicalJson(map[key]!!))
+        }
+        return j
+    }
+
+    private fun valueToCanonicalJson(value: Any): Any {
+        return when (value) {
+            is Map<*, *> -> mapToCanonicalJsonObject(value as Map<String, Any>)
+            is List<*> -> JSONArray(
+                value.map { item ->
+                    if (item is Map<*, *>) mapToCanonicalJsonObject(item as Map<String, Any>) else item
+                },
+            )
+            else -> value
+        }
+    }
+
+    private fun profileRequestFingerprint(
+        code: String,
+        additionalInfo: Map<String, Any>,
+        cohorts: Map<String, Any>,
+    ): String {
+        return JSONObject().apply {
+            put("code", code)
+            put("additionalInfo", mapToCanonicalJsonObject(additionalInfo))
+            put("cohorts", mapToCanonicalJsonObject(cohorts))
+        }.toString()
     }
 
     private fun getPersistentDeviceId(): String {
@@ -262,6 +349,29 @@ class PushApp private constructor() {
         prefs.edit().putBoolean("registered", true).apply()
     }
 
+    private fun clearRegisteredState() {
+        context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("registered", false)
+            .remove(PREF_SYNCED_PUSH_TOKEN)
+            .apply()
+        persistGuestId(null)
+        lifecycleState = SdkLifecycle.INITIALIZED
+    }
+
+    /** After successful device delink, register again as a fresh guest device. */
+    private fun reregisterDeviceAfterDelink() {
+        val prefs = context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE)
+        val token = prefs.getString("fcm_token", null)
+        clearRegisteredState()
+        if (token.isNullOrBlank()) {
+            PushAppLogger.warn("PushApp", "Cannot re-register after delink: no cached FCM token")
+            return
+        }
+        PushAppLogger.debug("PushApp", "Delink complete — re-registering device")
+        postDeviceRegister("android", token, callback = null)
+    }
+
     // ------------------ Page tracking ------------------
 
     fun setCurrentActivity(activity: Activity?) {
@@ -279,6 +389,68 @@ class PushApp private constructor() {
     }
 
     // ------------------ Device Token ------------------
+
+    private fun pushTokenPrefs() =
+        context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE)
+
+    private fun cachePushTokenLocally(token: String) {
+        pushTokenPrefs().edit().putString("fcm_token", token).apply()
+    }
+
+    /** Token last acknowledged by register or update API. */
+    private fun getSyncedPushToken(): String? {
+        val prefs = pushTokenPrefs()
+        val synced = prefs.getString(PREF_SYNCED_PUSH_TOKEN, null)?.takeIf { it.isNotEmpty() }
+        if (synced != null) return synced
+        // Legacy installs: treat cached FCM as synced when already registered.
+        return if (hasRegistered()) prefs.getString("fcm_token", null)?.takeIf { it.isNotEmpty() } else null
+    }
+
+    private fun setSyncedPushToken(token: String) {
+        pushTokenPrefs().edit()
+            .putString(PREF_SYNCED_PUSH_TOKEN, token)
+            .putString("fcm_token", token)
+            .apply()
+    }
+
+    private fun tokenContactId(): String? {
+        val guest = guestId ?: pushTokenPrefs().getString(PREF_GUEST_ID, null)?.takeIf { it.isNotEmpty() }
+        return guest?.let { "${it}_${getPersistentDeviceId()}" }
+    }
+
+    /**
+     * After successful register: if token differs from last sync, POST /pushapp/api/update/token.
+     * Never calls register again when the device is already registered.
+     */
+    private fun handlePushTokenAfterRegister(
+        newToken: String,
+        callback: ((Boolean) -> Unit)? = null,
+    ): Boolean {
+        if (newToken.isBlank()) return false
+        cachePushTokenLocally(newToken)
+
+        if (!hasRegistered()) {
+            return false
+        }
+
+        val synced = getSyncedPushToken()
+        if (synced == newToken) {
+            PushAppLogger.debug("PushApp", "Push token unchanged from last sync — skipping update API")
+            callback?.let { cb -> Handler(Looper.getMainLooper()).post { cb(true) } }
+            return true
+        }
+
+        val contactId = tokenContactId()
+        if (contactId == null) {
+            PushAppLogger.error("PushApp", "Cannot update push token: guestId missing (complete register first)")
+            callback?.let { cb -> Handler(Looper.getMainLooper()).post { cb(false) } }
+            return false
+        }
+
+        PushAppLogger.debug("PushApp", "Push token changed — calling update API")
+        updateDeviceToken(newToken, contactId, callback)
+        return true
+    }
 
     private fun registerDeviceToken() {
         // Verify Firebase is initialized before proceeding
@@ -303,34 +475,25 @@ class PushApp private constructor() {
                 return@addOnCompleteListener
             }
 
-            val prefs = context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE)
+            val prefs = pushTokenPrefs()
             val lastToken = prefs.getString("fcm_token", null)
             if (lastToken != null) {
                 PushAppLogger.debug("PushApp", "Cached FCM token present")
-            }else{
+            } else {
                 PushAppLogger.debug("PushApp", "No cached FCM token")
             }
 
-            if (lastToken == newToken) {
-                if (hasRegistered()) {
-                    PushAppLogger.debug("PushApp", "Token unchanged and device already registered — skipping register API")
-                    return@addOnCompleteListener
-                }
-                PushAppLogger.debug("PushApp", "Token unchanged — calling sendTokenToServer()")
-                sendTokenToServer("android", newToken)
-            } else if(lastToken == null){
-                PushAppLogger.debug("PushApp", "New FCM token — registering device")
-                sendTokenToServer("android", newToken)
-            } else {
-                // 🔄 Token changed — update it on server
-                PushAppLogger.debug("PushApp", "🔄 Token changed — calling updateDeviceToken()")
-                updateDeviceToken(newToken)
+            cachePushTokenLocally(newToken)
 
-                // Save new token
-                prefs.edit()
-                    .putString("fcm_token", newToken)
-                    .putBoolean("registered", true)
-                    .apply()
+            if (hasRegistered()) {
+                handlePushTokenAfterRegister(newToken)
+                return@addOnCompleteListener
+            }
+
+            if (lastToken == newToken) {
+                PushAppLogger.debug("PushApp", "Token unchanged — waiting for register()")
+            } else {
+                PushAppLogger.debug("PushApp", "New FCM token cached — call register() to register with server")
             }
         }
     }
@@ -339,8 +502,8 @@ class PushApp private constructor() {
 
     fun handleDeviceToken(token: String) {
         PushAppLogger.logPushToken("PushApp", "FCM token (onNewToken)", token)
-        PushAppLogger.debug("PushApp", "Handling device token update")
-        sendTokenToServer("android", token)
+        PushAppLogger.debug("PushApp", "Handling device token refresh")
+        handlePushTokenAfterRegister(token)
     }
 
     // ------------------ Headers ------------------
@@ -368,6 +531,16 @@ class PushApp private constructor() {
         headers["X-Boot-Time"] = android.os.Build.BOOTLOADER ?: ""
         headers["X-Bundle-ID"] = context.packageName
 
+        if (pushAppId.isNotEmpty()) {
+            headers["x-app-id"] = pushAppId
+        }
+        if (appSecretKey.isNotEmpty()) {
+            headers["x-app-key"] = appSecretKey
+        }
+
+        headers["sdk_framework"] = "ionic"
+        headers["sdk_version"] = com.mehery.pushapp.BuildConfig.VERSION_NAME
+
         try {
             val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
             headers["X-App-Version"] = packageInfo.versionName ?: ""
@@ -380,30 +553,6 @@ class PushApp private constructor() {
     }
 
     // ------------------ Registration ------------------
-
-    private fun sendTokenToServer(platform: String, token: String) {
-        if (serverUrl.isEmpty()) {
-            PushAppLogger.error("PushApp", "Cannot send token: PushApp not initialized")
-            return
-        }
-        if (lifecycleState.ordinal < SdkLifecycle.REGISTERED.ordinal) {
-            PushAppLogger.warn(
-                "PushApp",
-                "Token received but register() was not called yet — caching locally. " +
-                    "Call register() after initialize() to register with the server.",
-            )
-            context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE).edit()
-                .putString("fcm_token", token)
-                .apply()
-            PushAppLogger.logPushToken("PushApp", "FCM token (cached)", token)
-            return
-        }
-        if (hasRegistered()) {
-            PushAppLogger.debug("PushApp", "Device already registered. Skipping registration.")
-            return
-        }
-        postDeviceRegister(platform, token, callback = null)
-    }
 
     /**
      * POST push token to `/pushapp/api/device/register`.
@@ -430,25 +579,29 @@ class PushApp private constructor() {
         }
         PushAppLogger.logPushToken("PushApp", "FCM token (register)", tokenToSend)
         if (hasRegistered()) {
-            val savedToken = prefs.getString("fcm_token", null)
-            if (savedToken == tokenToSend) {
-                PushAppLogger.debug("PushApp", "Device already registered with same token — skipping register API")
-                if (lifecycleState == SdkLifecycle.INITIALIZED) {
-                    lifecycleState = SdkLifecycle.REGISTERED
-                }
-                if (guestId == null) {
-                    guestId = prefs.getString(PREF_GUEST_ID, null)?.takeIf { it.isNotEmpty() }
-                }
+            if (lifecycleState == SdkLifecycle.INITIALIZED) {
+                lifecycleState = SdkLifecycle.REGISTERED
+            }
+            if (guestId == null) {
+                guestId = prefs.getString(PREF_GUEST_ID, null)?.takeIf { it.isNotEmpty() }
+            }
+            if (handlePushTokenAfterRegister(tokenToSend, callback)) {
                 notifyAppOpen()
-                Handler(Looper.getMainLooper()).post { callback(true) }
                 return
             }
-            PushAppLogger.debug("PushApp", "FCM token changed — re-registering device")
+            PushAppLogger.error("PushApp", "Device registered but push token update could not run")
+            Handler(Looper.getMainLooper()).post { callback(false) }
+            return
         }
         postDeviceRegister("android", tokenToSend, callback = callback)
     }
 
-    private fun postDeviceRegister(platform: String, token: String, callback: ((Boolean) -> Unit)?) {
+    private fun postDeviceRegister(
+        platform: String,
+        token: String,
+        callback: ((Boolean) -> Unit)?,
+        attempt: Int = 1,
+    ) {
         val url = "$serverUrl/pushapp/api/device/register"
 
         val json = JSONObject().apply {
@@ -466,13 +619,26 @@ class PushApp private constructor() {
             PushAppLogger.debug("PushApp", "Header: $k = $v")
         }
 
-        PushAppLogger.debug("PushApp", "SendToken API URL: $url")
+        PushAppLogger.debug("PushApp", "SendToken API URL: $url (attempt $attempt/$REGISTER_MAX_ATTEMPTS)")
         PushAppLogger.debug("PushApp", "Request Body: ${json.toString(2)}")
 
         val request = requestBuilder.build()
         httpClient.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                PushAppLogger.error("PushApp", "Failed to send token to server: ${e.message}")
+                if (attempt < REGISTER_MAX_ATTEMPTS) {
+                    PushAppLogger.warn(
+                        "PushApp",
+                        "Register API failed (attempt $attempt/$REGISTER_MAX_ATTEMPTS): ${e.message} — retrying",
+                    )
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        postDeviceRegister(platform, token, callback, attempt + 1)
+                    }, REGISTER_RETRY_DELAY_MS)
+                    return
+                }
+                PushAppLogger.error(
+                    "PushApp",
+                    "Register API failed after $REGISTER_MAX_ATTEMPTS attempts: ${e.message}",
+                )
                 callback?.let { cb ->
                     Handler(Looper.getMainLooper()).post { cb(false) }
                 }
@@ -481,6 +647,8 @@ class PushApp private constructor() {
             override fun onResponse(call: Call, response: Response) {
                 val responseBody = response.body?.string()
                 val success = response.isSuccessful
+                response.close()
+
                 if (success) {
                     PushAppLogger.debug("PushApp", "SendToken API success, code=${response.code}")
                     PushAppLogger.debug("PushApp", "Response Body: $responseBody")
@@ -490,6 +658,7 @@ class PushApp private constructor() {
                     context.getSharedPreferences("pushapp_prefs", Context.MODE_PRIVATE).edit()
                         .putString("fcm_token", token)
                         .apply()
+                    setSyncedPushToken(token)
 
                     try {
                         val responseJson = JSONObject(responseBody ?: "{}")
@@ -501,14 +670,31 @@ class PushApp private constructor() {
                     }
 
                     flushBufferedEvents()
+                    notifyAppInstall()
                     notifyAppOpen()
-                } else {
-                    PushAppLogger.error("PushApp", "SendToken API failed: HTTP ${response.code}")
-                    PushAppLogger.error("PushApp", "Response Body: $responseBody")
+                    callback?.let { cb ->
+                        Handler(Looper.getMainLooper()).post { cb(true) }
+                    }
+                    return
                 }
-                response.close()
+
+                PushAppLogger.error("PushApp", "SendToken API failed: HTTP ${response.code}")
+                PushAppLogger.error("PushApp", "Response Body: $responseBody")
+
+                if (attempt < REGISTER_MAX_ATTEMPTS) {
+                    PushAppLogger.warn(
+                        "PushApp",
+                        "Register API failed (attempt $attempt/$REGISTER_MAX_ATTEMPTS) — retrying",
+                    )
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        postDeviceRegister(platform, token, callback, attempt + 1)
+                    }, REGISTER_RETRY_DELAY_MS)
+                    return
+                }
+
+                PushAppLogger.error("PushApp", "Register API failed after $REGISTER_MAX_ATTEMPTS attempts")
                 callback?.let { cb ->
-                    Handler(Looper.getMainLooper()).post { cb(success) }
+                    Handler(Looper.getMainLooper()).post { cb(false) }
                 }
             }
         })
@@ -516,22 +702,30 @@ class PushApp private constructor() {
 
     // ------------------ Login ------------------
 
-    fun login(userId: String): Boolean {
+    /**
+     * Links the device to [userId]. Invokes [callback] on the main thread when the
+     * `/pushapp/api/device/link` request finishes — only then is [isDeviceLinkCompleted] true.
+     */
+    fun login(userId: String, callback: (Boolean) -> Unit) {
         if (lifecycleState == SdkLifecycle.NOT_INITIALIZED || serverUrl.isEmpty()) {
             logSequenceError("login() requires initialize() first", lifecycleState)
-            return false
+            Handler(Looper.getMainLooper()).post { callback(false) }
+            return
         }
         if (lifecycleState == SdkLifecycle.INITIALIZED) {
             logSequenceError("login() requires register() first", lifecycleState)
-            return false
+            Handler(Looper.getMainLooper()).post { callback(false) }
+            return
         }
         if (userId.isBlank()) {
             PushAppLogger.error("PushApp", "login() failed: userId is empty")
-            return false
+            Handler(Looper.getMainLooper()).post { callback(false) }
+            return
         }
 
         this.userId = userId
         lifecycleState = SdkLifecycle.LOGGED_IN
+        setDeviceLinkCompleted(false)
         val url = "$serverUrl/pushapp/api/device/link"
 
         val json = JSONObject().apply {
@@ -555,14 +749,17 @@ class PushApp private constructor() {
         httpClient.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 PushAppLogger.error("PushApp", "Login API failed: ${e.message}")
+                revertFailedLogin()
+                Handler(Looper.getMainLooper()).post { callback(false) }
             }
 
             override fun onResponse(call: Call, response: Response) {
                 val responseBody = response.body?.string()
-                if (response.isSuccessful) {
-                    // Persist userId in SharedPreferences
+                val success = response.isSuccessful
+                if (success) {
                     val prefs = context.getSharedPreferences("PushAppPrefs", Context.MODE_PRIVATE)
                     prefs.edit().putString("pushapp_user_id", userId).apply()
+                    setDeviceLinkCompleted(true)
                     PushAppLogger.debug("PushApp", "Login API success, code=${response.code}")
                     PushAppLogger.debug("PushApp", "Response Body: $responseBody")
 
@@ -571,11 +768,22 @@ class PushApp private constructor() {
                 } else {
                     PushAppLogger.error("PushApp", "Login API failed: HTTP ${response.code}")
                     PushAppLogger.error("PushApp", "Response Body: $responseBody")
+                    revertFailedLogin()
                 }
                 response.close()
+                Handler(Looper.getMainLooper()).post { callback(success) }
             }
         })
-        return true
+    }
+
+    private fun revertFailedLogin() {
+        userId = null
+        setDeviceLinkCompleted(false)
+        lifecycleState = if (hasRegistered()) SdkLifecycle.REGISTERED else SdkLifecycle.INITIALIZED
+        context.getSharedPreferences("PushAppPrefs", Context.MODE_PRIVATE)
+            .edit()
+            .remove("pushapp_user_id")
+            .apply()
     }
 
     fun logout(callback: (Boolean) -> Unit) {
@@ -614,6 +822,8 @@ class PushApp private constructor() {
                 val success = response.isSuccessful
                 if (!success) {
                     PushAppLogger.error("PushApp", "Logout delink API failed: HTTP ${response.code}")
+                } else {
+                    reregisterDeviceAfterDelink()
                 }
                 response.close()
                 Handler(Looper.getMainLooper()).post { callback(success) }
@@ -623,6 +833,8 @@ class PushApp private constructor() {
 
     private fun clearLocalUserSession() {
         userId = null
+        setDeviceLinkCompleted(false)
+        lastSuccessfulProfileRequestFingerprint = null
         webSocketManager?.disconnect()
         webSocketManager = null
         lifecycleState = if (hasRegistered()) SdkLifecycle.REGISTERED else SdkLifecycle.INITIALIZED
@@ -633,7 +845,7 @@ class PushApp private constructor() {
     }
 
     /**
-     * Creates or updates customer profile. Call after login with the same `code` your app uses (e.g. userId_deviceId).
+     * Creates or updates customer profile. Call after login with `code` = userId.
      * Matches Flutter/iOS: PUT to .../customer/profile?code=... with body { additionalInfo, cohorts, code }.
      */
     fun createOrUpdateCustomerProfile(
@@ -647,9 +859,25 @@ class PushApp private constructor() {
             Handler(Looper.getMainLooper()).post { callback(false) }
             return
         }
+        if (!deviceLinkCompleted) {
+            PushAppLogger.error(
+                "PushApp",
+                "saveUserData() requires successful login() / device link. " +
+                    "Call login() and wait for /pushapp/api/device/link to succeed.",
+            )
+            Handler(Looper.getMainLooper()).post { callback(false) }
+            return
+        }
         if (code.isEmpty()) {
             PushAppLogger.error("PushApp", "code is required for customer profile")
             Handler(Looper.getMainLooper()).post { callback(false) }
+            return
+        }
+
+        val fingerprint = profileRequestFingerprint(code, additionalInfo, cohorts)
+        if (fingerprint == lastSuccessfulProfileRequestFingerprint) {
+            PushAppLogger.debug("PushApp", "Customer profile unchanged — skipping duplicate PUT")
+            Handler(Looper.getMainLooper()).post { callback(true) }
             return
         }
 
@@ -684,6 +912,8 @@ class PushApp private constructor() {
                 PushAppLogger.debug("PushApp", "Customer profile response: ${response.code}")
                 if (!success) {
                     PushAppLogger.error("PushApp", "Response body: ${response.body?.string()}")
+                } else {
+                    lastSuccessfulProfileRequestFingerprint = fingerprint
                 }
                 response.close()
                 Handler(Looper.getMainLooper()).post { callback(success) }
@@ -739,9 +969,7 @@ class PushApp private constructor() {
                 if (response.isSuccessful) {
                     PushAppLogger.debug("PushApp", "Event sent successfully")
                     PushAppLogger.debug("PushApp", "Response Body: $bodyStr")
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        userId?.let { pollForInApp(it) }
-                    }, 2000)
+                    scheduleInAppPollAfterEvent()
                 } else {
                     PushAppLogger.error("PushApp", "Failed to send event: ${response.code}")
                     PushAppLogger.error("PushApp", "Response Body: $bodyStr")
@@ -751,12 +979,20 @@ class PushApp private constructor() {
         })
     }
 
-    fun updateDeviceToken(token: String) {
-        PushAppLogger.debug("PushApp", "🔄 updateDeviceToken() called")
+    private fun updateDeviceToken(
+        token: String,
+        contactId: String,
+        callback: ((Boolean) -> Unit)? = null,
+    ) {
+        if (!hasRegistered()) {
+            PushAppLogger.error("PushApp", "Cannot update push token before successful register")
+            callback?.let { cb -> Handler(Looper.getMainLooper()).post { cb(false) } }
+            return
+        }
+
+        PushAppLogger.debug("PushApp", "updateDeviceToken() contact_id=$contactId")
 
         val url = "$serverUrl/pushapp/api/update/token"
-        val deviceId = getPersistentDeviceId()
-        val contactId = "${userId}_${deviceId}"
 
         try {
             val json = JSONObject().apply {
@@ -768,35 +1004,37 @@ class PushApp private constructor() {
             val requestBody = json.toString().toRequestBody("application/json".toMediaType())
             val requestBuilder = Request.Builder().url(url).post(requestBody)
 
-            // Add headers (optional — use your own method if you have one)
             getDeviceHeaders().forEach { (k, v) ->
                 requestBuilder.addHeader(k, v)
-                PushAppLogger.debug("PushApp", "Header: $k = $v")
             }
 
-            PushAppLogger.debug("PushApp", "URL: $url")
+            PushAppLogger.debug("PushApp", "Update token URL: $url")
             PushAppLogger.debug("PushApp", "Request Body: ${json.toString(2)}")
 
-            val request = requestBuilder.build()
-            httpClient.newCall(request).enqueue(object : Callback {
+            httpClient.newCall(requestBuilder.build()).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    PushAppLogger.error("PushApp", "🔥 Error updating device token: ${e.message}")
+                    PushAppLogger.error("PushApp", "Error updating device token: ${e.message}")
+                    callback?.let { cb -> Handler(Looper.getMainLooper()).post { cb(false) } }
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     val bodyStr = response.body?.string()
-                    if (response.isSuccessful) {
-                        PushAppLogger.debug("PushApp", "✅ Token updated successfully on server.")
+                    val success = response.isSuccessful
+                    if (success) {
+                        PushAppLogger.debug("PushApp", "Token updated successfully on server")
                         PushAppLogger.debug("PushApp", "Response Body: $bodyStr")
+                        setSyncedPushToken(token)
                     } else {
-                        PushAppLogger.error("PushApp", "❌ Failed to update token: ${response.code}")
+                        PushAppLogger.error("PushApp", "Failed to update token: ${response.code}")
                         PushAppLogger.error("PushApp", "Response Body: $bodyStr")
                     }
                     response.close()
+                    callback?.let { cb -> Handler(Looper.getMainLooper()).post { cb(success) } }
                 }
             })
         } catch (e: Exception) {
-            PushAppLogger.error("PushApp", "🔥 Exception in updateDeviceToken: ${e.message}")
+            PushAppLogger.error("PushApp", "Exception in updateDeviceToken: ${e.message}")
+            callback?.let { cb -> Handler(Looper.getMainLooper()).post { cb(false) } }
         }
     }
 
@@ -948,6 +1186,14 @@ class PushApp private constructor() {
 
 
     // ------------------ Poll In-App ------------------
+
+    /** Schedules in-app poll using logged-in `userId` or pre-login `guestId` as contact_id prefix. */
+    private fun scheduleInAppPollAfterEvent() {
+        val contactUserId = userId ?: guestId ?: return
+        Handler(Looper.getMainLooper()).postDelayed({
+            pollForInApp(contactUserId)
+        }, IN_APP_POLL_DELAY_MS)
+    }
 
     private fun pollForInApp(userId: String) {
         val url = "$serverUrl/pushapp/api/v1/notification/in-app/poll"

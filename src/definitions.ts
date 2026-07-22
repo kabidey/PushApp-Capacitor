@@ -20,8 +20,12 @@ export interface UIOptions {
 export interface PushAppPlugin {
   // Existing Core Methods
   /**
-   * Initialize the SDK. Pass your **channel id** as **App ID** (`appId`).
-   * The tenant subdomain is derived from the substring before the first `_` (e.g. `demo` from `demo_1763369170735`).
+   * Initialize the SDK.
+   *
+   * - `appId` — channel id (e.g. `demo_1763369170735`). Tenant subdomain is the prefix before the first `_`.
+   * - `pushAppId` — optional PushApp API App Id (e.g. `pa_…`), sent as `x-app-id` when provided.
+   * - `appSecretKey` — optional PushApp App Secret Key (e.g. `pas_…`), sent as `x-app-key` when provided.
+   *
    * Use `identifier` only for backward compatibility; it is the same value as `appId`.
    *
    * `debugMode` enables verbose native logs in debug builds only (tokens/PII are redacted).
@@ -29,25 +33,43 @@ export interface PushAppPlugin {
    */
   initialize(
     options:
-      | { appId: string; sandbox?: boolean; debugMode?: boolean; slackWebhookUrl?: string }
-      | { identifier: string; sandbox?: boolean; debugMode?: boolean; slackWebhookUrl?: string },
+      | {
+          appId: string;
+          pushAppId?: string;
+          appSecretKey?: string;
+          sandbox?: boolean;
+          debugMode?: boolean;
+          slackWebhookUrl?: string;
+        }
+      | {
+          identifier: string;
+          pushAppId?: string;
+          appSecretKey?: string;
+          sandbox?: boolean;
+          debugMode?: boolean;
+          slackWebhookUrl?: string;
+        },
   ): Promise<{ status: string }>;
   /**
-   * POST push token to `/pushapp/api/device/register`.
-   * Call after `initialize`. Skips the API when the device is already registered with the same token.
-   * - Android: provide `fcmToken` (it is sent as backend `token`).
-   * - iOS: provide `apnsToken` (sent as backend `token`) and optional `fcmToken` (sent as backend `fcm_token`).
-   * Legacy fallback: `token` is accepted as alias for the platform primary token.
+   * Register this device for push messaging after `initialize`.
+   *
+   * Safe to call on every app launch. The SDK avoids duplicate registration for the
+   * same token and updates the stored token automatically if it changes later.
+   *
+   * - Android: provide `fcmToken`, or pass an empty string to use the native cached token.
+   * - iOS: provide `apnsToken` and optional `fcmToken`, or use native cached tokens.
+   * - Legacy fallback: `token` is accepted as alias for the platform primary token.
    */
   register(options: {
     apnsToken?: string;
     fcmToken?: string;
     token?: string;
   }): Promise<{ status: string; success: boolean }>;
+  /** Links device to userId. Resolves only after `/device/link` succeeds (deviceLinkCompleted). */
   login(options: { userId: string }): Promise<{ status: string }>;
   /** Delink the device from the current user. Clears local session; calls server delink when a user was logged in. */
   logout(): Promise<{ status: string }>;
-  /** Create or update customer profile (PUT). Call after login with code = userId_deviceId. */
+  /** Create or update customer profile (PUT). Call after login with code = userId. */
   saveUserData(options: {
     code: string;
     additionalInfo: Record<string, unknown>;
@@ -76,4 +98,15 @@ export interface PushAppPlugin {
 
   /** Tracks a push notification event (e.g. "opened" or "cta"). Use when user opens a notification or taps a CTA. */
   trackPushNotificationEvent(options: { token: string; event: string; ctaId?: string }): Promise<{ success: boolean }>;
+
+  /**
+   * Forward a push payload into the SDK (tray / in-app routing).
+   * Use when the host app owns FCM via `@capacitor/push-notifications` (or another
+   * FirebaseMessagingService) and the SDK's native service does not receive messages.
+   */
+  handlePushNotification(options: {
+    title?: string;
+    body?: string;
+    data?: Record<string, unknown>;
+  }): Promise<{ status: string }>;
 }

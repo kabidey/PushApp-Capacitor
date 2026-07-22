@@ -17,12 +17,17 @@ public class PushAppPlugin: CAPPlugin {
             return
         }
 
+        let pushAppId = call.getString("pushAppId") ?? ""
+        let appSecretKey = call.getString("appSecretKey") ?? ""
+
         let sandbox = call.getBool("sandbox") ?? false
         let debugMode = call.getBool("debugMode") ?? false
         let slackWebhookUrl = call.getString("slackWebhookUrl")
 
         let initialized = PushApp.shared.initialize(
             appId: appId,
+            pushAppId: pushAppId,
+            appSecretKey: appSecretKey,
             sandbox: sandbox,
             slackWebhookUrl: slackWebhookUrl,
             debugMode: debugMode
@@ -39,7 +44,10 @@ public class PushAppPlugin: CAPPlugin {
 
     /// POST push token to `/pushapp/api/device/register`. Call after `initialize` when you have APNs (hex) or FCM token.
     @objc func register(_ call: CAPPluginCall) {
-        let apnsToken = call.getString("apnsToken") ?? call.getString("token")
+        var apnsToken = call.getString("apnsToken") ?? call.getString("token")
+        if apnsToken == nil || apnsToken!.isEmpty {
+            apnsToken = UserDefaults.standard.string(forKey: "apns_token")
+        }
         guard let apnsToken = apnsToken, !apnsToken.isEmpty else {
             reject(call, code: PushAppErrorCodes.emptyToken)
             return
@@ -48,7 +56,10 @@ public class PushAppPlugin: CAPPlugin {
             reject(call, code: PushAppErrorCodes.notInitialized)
             return
         }
-        let fcmToken = call.getString("fcmToken")
+        var fcmToken = call.getString("fcmToken")
+        if fcmToken == nil || fcmToken!.isEmpty {
+            fcmToken = UserDefaults.standard.string(forKey: "fcm_token")
+        }
         PushApp.shared.register(apnsToken: apnsToken, fcmToken: fcmToken) { success in
             if success {
                 call.resolve(["status": "registered", "success": true])
@@ -70,15 +81,15 @@ public class PushAppPlugin: CAPPlugin {
             return
         }
 
-        let loggedIn = PushApp.shared.login(userId: userId)
-        if !loggedIn {
-            reject(call, code: PushAppErrorCodes.loginFailed)
-            return
+        PushApp.shared.login(userId: userId) { success in
+            if success {
+                call.resolve([
+                    "status": "logged_in"
+                ])
+            } else {
+                self.reject(call, code: PushAppErrorCodes.loginFailed)
+            }
         }
-
-        call.resolve([
-            "status": "logged_in"
-        ])
     }
 
     @objc func logout(_ call: CAPPluginCall) {
@@ -120,6 +131,10 @@ public class PushAppPlugin: CAPPlugin {
         guard let additionalInfoDict = additionalInfo as? [String: Any],
               let cohortsDict = cohorts as? [String: Any] else {
             reject(call, code: PushAppErrorCodes.invalidProfileData)
+            return
+        }
+        guard PushApp.shared.isDeviceLinkCompleted() else {
+            reject(call, code: PushAppErrorCodes.deviceLinkRequired)
             return
         }
         PushApp.shared.updateCustomerProfile(code: code, cohorts: cohortsDict, additionalInfo: additionalInfoDict) { success in
@@ -296,5 +311,11 @@ public class PushAppPlugin: CAPPlugin {
         PushApp.shared.trackPushNotificationEvent(token: token, event: event, ctaId: ctaId) { success in
             call.resolve(["success": success])
         }
+    }
+
+    /// Host-app forward path when Capacitor (or another owner) received the push.
+    /// On iOS the system tray is OS-managed; this resolves so Android/JS callers share one API.
+    @objc func handlePushNotification(_ call: CAPPluginCall) {
+        call.resolve(["status": "handled"])
     }
 }

@@ -4,12 +4,15 @@ enum PushAppErrorCodes {
     static let notInitialized = "NOT_INITIALIZED"
     static let invalidAppId = "INVALID_APP_ID"
     static let appIdRequired = "APP_ID_REQUIRED"
+    static let pushAppIdRequired = "PUSH_APP_ID_REQUIRED"
+    static let appSecretKeyRequired = "APP_SECRET_KEY_REQUIRED"
     static let contextUnavailable = "CONTEXT_UNAVAILABLE"
     static let registerRequired = "REGISTER_REQUIRED"
     static let emptyToken = "EMPTY_TOKEN"
     static let registerFailed = "REGISTER_FAILED"
     static let emptyUserId = "EMPTY_USER_ID"
     static let loginFailed = "LOGIN_FAILED"
+    static let deviceLinkRequired = "DEVICE_LINK_REQUIRED"
     static let logoutFailed = "LOGOUT_FAILED"
     static let customerProfileFailed = "CUSTOMER_PROFILE_FAILED"
     static let missingCode = "MISSING_CODE"
@@ -36,6 +39,10 @@ enum PushAppErrorCodes {
             return "Initialize failed. appId must include a tenant prefix before the first '_' (e.g. demo_1763369170735)."
         case appIdRequired:
             return "appId is required (channel id / App ID)."
+        case pushAppIdRequired:
+            return "pushAppId was not provided (optional API App Id, e.g. pa_…)."
+        case appSecretKeyRequired:
+            return "appSecretKey was not provided (optional App Secret Key, e.g. pas_…)."
         case contextUnavailable:
             return "Android context is not available."
         case registerRequired:
@@ -48,12 +55,14 @@ enum PushAppErrorCodes {
             return "userId is required."
         case loginFailed:
             return "Login failed. The server did not confirm the device link."
+        case deviceLinkRequired:
+            return "saveUserData() requires a successful login() / device link. Call login() and wait for it to complete."
         case logoutFailed:
             return "Logout failed. Local session was cleared but the server delink call failed."
         case customerProfileFailed:
             return "Customer profile update failed."
         case missingCode:
-            return "code is required (e.g. userId_deviceId)."
+            return "code is required (userId)."
         case missingProfileData:
             return "additionalInfo and cohorts are required and must be objects."
         case invalidProfileData:

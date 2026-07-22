@@ -2,6 +2,11 @@ import { Component, OnInit } from '@angular/core';
 import { PushApp } from 'pushapp-ionic';
 import { NavController } from '@ionic/angular';
 import { slackWebhookInitOption } from '../../environments/slack-webhook';
+import {
+  PUSHAPP_API_APP_ID,
+  PUSHAPP_APP_SECRET_KEY,
+  PUSHAPP_CHANNEL_ID,
+} from '../../environments/pushapp-credentials';
 import { initializeAndRegisterPushApp } from '../pushapp-setup';
 
 @Component({
@@ -49,7 +54,9 @@ export class LoginPage implements OnInit {
 
     try {
       await initializeAndRegisterPushApp({
-        appId: "demo_1763369170735",
+        appId: PUSHAPP_CHANNEL_ID,
+        pushAppId: PUSHAPP_API_APP_ID,
+        appSecretKey: PUSHAPP_APP_SECRET_KEY,
         sandbox: true,
         debugMode: true,
         ...slackWebhookInitOption(),
@@ -76,35 +83,32 @@ export class LoginPage implements OnInit {
 
       console.log("Login response:", res);
 
-      // Create/update customer profile after login (code = userId_deviceId)
-      try {
-        const headers = await PushApp.getDeviceHeaders();
-        const deviceId = headers['X-Device-ID'] ?? '';
-        const code = `${this.username}_${deviceId}`;
-        const additionalInfo = {
-          expiry_date: LoginPage.randomExpiryTimestampMoreThan5Years(),
-          dob: LoginPage.randomDobTimestamp(),
-          gender: LoginPage.randomGender(),
-        };
-        const cohorts = {
-          login_type: 'password',
-          username_present: true,
-          user_segment: 'test_user',
-        };
-        console.log("Saving customer profile for code:", code);
-        await PushApp.saveUserData({
-          code,
-          additionalInfo,
-          cohorts,
-        });
-      } catch (profileErr) {
-        console.warn("Customer profile update failed (non-blocking):", profileErr);
+      if (res?.status !== 'logged_in') {
+        throw new Error(`Login did not succeed: ${JSON.stringify(res)}`);
       }
 
-      // Store username in localStorage for dashboard
-      localStorage.setItem('username', this.username);
+      // login() resolves only after device link succeeds — safe to save profile
+      try {
+        console.log('Saving customer profile for userId:', this.username);
+        await PushApp.saveUserData({
+          code: this.username,
+          additionalInfo: {
+            expiry_date: LoginPage.randomExpiryTimestampMoreThan5Years(),
+            dob: LoginPage.randomDobTimestamp(),
+            gender: LoginPage.randomGender(),
+          },
+          cohorts: {
+            login_type: 'password',
+            username_present: true,
+            user_segment: 'test_user',
+          },
+        });
+        console.log('Customer profile saved after successful login');
+      } catch (profileErr) {
+        console.warn('Customer profile update failed (non-blocking):', profileErr);
+      }
 
-      // Navigate to home page (after login)
+      localStorage.setItem('username', this.username);
       this.navCtrl.navigateRoot('/home');
 
     } catch (err) {

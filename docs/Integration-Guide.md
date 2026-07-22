@@ -316,16 +316,14 @@ import { PushApp } from 'pushapp-ionic';
 
 const res = await PushApp.login({ userId: this.username });
 
-const headers = await PushApp.getDeviceHeaders();
-const deviceId = headers['X-Device-ID'] ?? '';
-const code = `${this.username}_${deviceId}`;
-
 await PushApp.saveUserData({
-  code,
+  code: this.username, // userId (not contact id / userId_deviceId)
   additionalInfo: { /* your fields */ },
   cohorts: { /* your segments */ },
 });
 ```
+
+`login()` resolves only after `/pushapp/api/device/link` succeeds, so `saveUserData()` is safe to call immediately afterward.
 
 ---
 
@@ -456,12 +454,8 @@ Example: `example-app/src/app/home/home.page.ts` → `logout()` method.
 Send user profile and segmentation data after login:
 
 ```typescript
-const headers = await PushApp.getDeviceHeaders();
-const deviceId = headers['X-Device-ID'] ?? '';
-const code = `${userId}_${deviceId}`;
-
 await PushApp.saveUserData({
-  code,
+  code: userId, // userId — not contact id (userId_deviceId)
   additionalInfo: {
     city: 'Mumbai',
     plan: 'premium',
@@ -673,7 +667,7 @@ try {
 | `EMPTY_TOKEN` | No push token yet | Retry `register()` — see `pushapp-setup.ts` |
 | `REGISTER_REQUIRED` | `login()` before `register()` | Call `register()` first |
 | `REGISTER_FAILED` | Register API failed | Check network, App ID, Firebase config |
-| `LOGIN_FAILED` | Login API failed | Ensure `register()` succeeded first |
+| `LOGIN_FAILED` | Device link API failed or login preconditions not met | Ensure `register()` succeeded; check network / credentials |
 | `LOGOUT_FAILED` | Server delink failed | Local session still cleared — safe to proceed |
 | `WEB_NOT_SUPPORTED` | Running in browser | Use a real device |
 | `INVALID_APP_ID` | App ID format wrong | Use `tenant_suffix` format |
@@ -690,4 +684,4 @@ Full list: `src/errors.ts` in the SDK package.
 
 ---
 
-*Document version: 2.0 — PushApp Ionic SDK 0.1.2*
+*Document version: 2.1 — PushApp Ionic SDK 0.2.0*

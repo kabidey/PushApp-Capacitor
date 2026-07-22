@@ -7,6 +7,12 @@ type PlaceholderSyncEntry = {
   registered: boolean;
   rafId: number;
   resizeObserver: { observe(target: Element): void; disconnect(): void } | null;
+  scrollTargets: EventTarget[];
+  onScroll: (() => void) | null;
+};
+
+type IonContentElement = HTMLElement & {
+  getScrollElement?: () => Promise<HTMLElement>;
 };
 
 const syncEntries = new Map<string, PlaceholderSyncEntry>();
@@ -58,6 +64,54 @@ async function waitForLayout(elementId: string, maxAttempts = 20): Promise<HTMLE
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return document.getElementById(elementId);
+}
+
+/**
+ * Ionic scrolls inside ion-content's shadow scroll element — those `scroll` events
+ * never reach `window`. Collect the real scroll containers for each placeholder.
+ */
+async function findScrollTargets(element: HTMLElement): Promise<EventTarget[]> {
+  const targets: EventTarget[] = [];
+  const seen = new Set<EventTarget>();
+
+  const add = (target: EventTarget | null | undefined) => {
+    if (!target || seen.has(target)) {
+      return;
+    }
+    seen.add(target);
+    targets.push(target);
+  };
+
+  const ionContent = element.closest('ion-content') as IonContentElement | null;
+  if (ionContent) {
+    add(ionContent);
+    if (typeof ionContent.getScrollElement === 'function') {
+      try {
+        add(await ionContent.getScrollElement());
+      } catch {
+        // ignore — fall through to overflow walk
+      }
+    }
+  }
+
+  let node: HTMLElement | null = element.parentElement;
+  while (node && node !== document.documentElement) {
+    const style = window.getComputedStyle(node);
+    const overflowY = style.overflowY;
+    const overflowX = style.overflowX;
+    const canScrollY =
+      (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
+      node.scrollHeight > node.clientHeight + 1;
+    const canScrollX =
+      (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') &&
+      node.scrollWidth > node.clientWidth + 1;
+    if (canScrollY || canScrollX) {
+      add(node);
+    }
+    node = node.parentElement;
+  }
+
+  return targets;
 }
 
 async function syncEntry(entry: PlaceholderSyncEntry, native: PushAppPlugin, register: boolean): Promise<void> {
@@ -155,11 +209,36 @@ function attachResizeObserver(entry: PlaceholderSyncEntry, element: HTMLElement,
   entry.resizeObserver.observe(element);
 }
 
+async function attachScrollTargets(entry: PlaceholderSyncEntry, element: HTMLElement, native: PushAppPlugin): Promise<void> {
+  detachScrollTargets(entry);
+
+  entry.onScroll = () => scheduleSync(entry, native);
+  entry.scrollTargets = await findScrollTargets(element);
+
+  for (const target of entry.scrollTargets) {
+    target.addEventListener('scroll', entry.onScroll, { passive: true });
+    // Ionic emits ionScroll on <ion-content>; keep overlay aligned while scrolling.
+    target.addEventListener('ionScroll', entry.onScroll as EventListener);
+  }
+}
+
+function detachScrollTargets(entry: PlaceholderSyncEntry): void {
+  if (entry.onScroll) {
+    for (const target of entry.scrollTargets) {
+      target.removeEventListener('scroll', entry.onScroll);
+      target.removeEventListener('ionScroll', entry.onScroll as EventListener);
+    }
+  }
+  entry.scrollTargets = [];
+  entry.onScroll = null;
+}
+
 function teardownEntry(entry: PlaceholderSyncEntry): void {
   if (entry.rafId) {
     cancelAnimationFrame(entry.rafId);
   }
   entry.resizeObserver?.disconnect();
+  detachScrollTargets(entry);
 }
 
 export async function startPlaceholderSync(
@@ -186,11 +265,14 @@ export async function startPlaceholderSync(
     registered: false,
     rafId: 0,
     resizeObserver: null,
+    scrollTargets: [],
+    onScroll: null,
   };
 
   syncEntries.set(options.placeholderId, entry);
   attachGlobalListeners(native);
   attachResizeObserver(entry, element, native);
+  await attachScrollTargets(entry, element, native);
   await syncEntry(entry, native, true);
 
   return { status: 'placeholder_registration_initiated' };

@@ -4,6 +4,38 @@ All notable changes to **pushapp-ionic** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-22
+
+API credentials, device-link login, host-owned FCM forwarding, and Ionic inline scroll sync.
+
+### Added
+
+- Optional **`pushAppId`** / **`appSecretKey`** on `initialize()` — sent as `x-app-id` / `x-app-key` when provided.
+- **`handlePushNotification({ title?, body?, data? })`** — forward FCM payloads when the host app owns Firebase Messaging.
+- Error codes: `PUSH_APP_ID_REQUIRED`, `APP_SECRET_KEY_REQUIRED`, `DEVICE_LINK_REQUIRED` (credentials codes reserved; initialize no longer rejects when credentials are omitted).
+- Example app pattern for `@capacitor-firebase/messaging` → SDK forward.
+
+### Changed
+
+- **`login()`** resolves only after `/device/link` succeeds.
+- **`saveUserData({ code })`** — `code` is **`userId`** (not `userId_deviceId`); requires successful device link.
+- README / Integration Guide updated for the above.
+
+### Fixed
+
+- **Inline placeholders** track Ionic `ion-content` scroll (not only `window` scroll).
+- **`app_install` / `app_open`** lifecycle event coverage improvements.
+
+### Upgrade guide: 0.1.2 → 0.2.0
+
+1. Pin `pushapp-ionic@^0.2.0` and run `npx cap sync`.
+2. Optionally pass `pushAppId` / `appSecretKey` on `initialize()`.
+3. Change `saveUserData` `code` to `userId` (drop `_deviceId` suffix).
+4. Await `login()` before `saveUserData()`.
+5. If another plugin owns FCM, forward with `handlePushNotification()` (see README).
+
+---
+
 ## [0.1.2] - 2026-06-29
 
 Complete hardening release: security, stable error contracts, CI, integration documentation, and push notification fixes. **Use this version** — npm `0.1.1` was published without these changes.
@@ -12,7 +44,7 @@ Complete hardening release: security, stable error contracts, CI, integration do
 
 - **`debugMode`** on `PushApp.initialize()` — verbose native logs in debug builds only (PII/tokens redacted).
 - **Stable error codes** on all native `call.reject(message, code)` paths; export `PushAppErrorCode`, `isPushAppError()`, `getPushAppErrorCode()` from npm package.
-- **`logout()`** — clears local session and POSTs `/pushapp/api/device/delink` when a user was logged in.
+- **`logout()`** — clears local session and delinks the device when a user was logged in.
 - **`PushAppLogger`** (iOS/Android) — release-safe logging with token/PII redaction.
 - **MIT `LICENSE`** and package `author` field.
 - **CI** (`.github/workflows/ci.yml`) — TypeScript lint/build/test, Android unit tests, iOS SwiftLint.
@@ -64,8 +96,9 @@ Repository housekeeping only (`.gitignore` for Capacitor build artifacts). **Int
 5. Call `PushApp.logout()` on user sign-out.
 6. Ensure **iOS deployment target ≥ 15.2** and **Android minSdk ≥ 23**.
 7. Declare `@capacitor/push-notifications` in your app (peer dependency).
-8. Follow the updated [Integration Guide](docs/Integration-Guide.md) and [QA Test Plan](docs/QA-Test-Plan.md).
+8. Follow the updated [Integration Guide](docs/Integration-Guide.md) and [QA Test Plan](QA-Test-Plan.md).
 
+[0.2.0]: https://github.com/mehery-soccom/PushApp-Capacitor/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/mehery-soccom/PushApp-Capacitor/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mehery-soccom/PushApp-Capacitor/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mehery-soccom/PushApp-Capacitor/releases/tag/v0.1.0
