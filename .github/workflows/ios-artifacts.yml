@@ -55,7 +55,7 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             -sdk iphonesimulator \
             build \
-            | tail -40
+            | grep -vE '^(Compile|CompileSwift|CompileC|PrecompileModule|SwiftDriverJobDiscovery|ScanDependencies|Ld |CodeSign|Touch|Copy|PhaseScriptExecution|ProcessInfoPlistFile|CpResource|PBXCp|WriteFile|SymLink|SetOwnerAndGroup|SetMode|SetGroup|CDRegistration|RegisterExecutionPolicyException|Validate|ExtractAppIntentsMetadata|AppIntentsSSO|DataModelVersionDetect|SwiftMergeGenerated|GenerateDSYMFile)'
 
       - name: Locate built .app
         id: locate
