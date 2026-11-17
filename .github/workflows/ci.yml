@@ -58,7 +58,7 @@ jobs:
           java-version: 21
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install dependencies
         run: |
@@ -82,7 +82,9 @@ jobs:
       - name: Install dependencies
         run: |
           npm install --legacy-peer-deps
-          npm install @rollup/rollup-linux-x64-gnu --no-save --legacy-peer-deps
+          # rollup native binary is platform-specific; install the
+          # macOS arm64 variant on Apple Silicon runners.
+          npm install @rollup/rollup-darwin-arm64 --no-save --legacy-peer-deps
 
       - name: SwiftLint
         run: npm run swiftlint -- lint

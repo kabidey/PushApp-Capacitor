@@ -209,7 +209,11 @@ function attachResizeObserver(entry: PlaceholderSyncEntry, element: HTMLElement,
   entry.resizeObserver.observe(element);
 }
 
-async function attachScrollTargets(entry: PlaceholderSyncEntry, element: HTMLElement, native: PushAppPlugin): Promise<void> {
+async function attachScrollTargets(
+  entry: PlaceholderSyncEntry,
+  element: HTMLElement,
+  native: PushAppPlugin,
+): Promise<void> {
   detachScrollTargets(entry);
 
   entry.onScroll = () => scheduleSync(entry, native);

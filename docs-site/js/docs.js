@@ -102,10 +102,7 @@ function configureMarked() {
 
   renderer.code = function (code, infostring) {
     const lang = (infostring || '').trim().split(/\s+/)[0] || 'text';
-    const escaped = code
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+    const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     return (
       `<div class="code-block-wrap">` +
       `<span class="code-lang">${lang}</span>` +
@@ -178,9 +175,7 @@ function extractSection(markdown, start, end) {
 }
 
 async function fetchMarkdown(repoPath) {
-  const urls = isLocalDev()
-    ? [localMarkdownUrl(repoPath), rawMarkdownUrl(repoPath)]
-    : [rawMarkdownUrl(repoPath)];
+  const urls = isLocalDev() ? [localMarkdownUrl(repoPath), rawMarkdownUrl(repoPath)] : [rawMarkdownUrl(repoPath)];
 
   let lastError;
   for (const url of urls) {
@@ -257,8 +252,7 @@ npx cap sync</code></pre>
 }
 
 function showLoading(container) {
-  container.innerHTML =
-    '<div class="loading"><div class="loading-spinner"></div>Loading documentation…</div>';
+  container.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading documentation…</div>';
 }
 
 function showError(container, message) {

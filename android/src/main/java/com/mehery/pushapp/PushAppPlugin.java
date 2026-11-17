@@ -46,7 +46,14 @@ public class PushAppPlugin extends Plugin {
         }
 
         boolean initialized = PushApp.Companion.getInstance().initialize(
-            context, appId, pushAppId, appSecretKey, sandbox, slackWebhookUrl, debugMode);
+            context,
+            appId,
+            pushAppId,
+            appSecretKey,
+            sandbox,
+            slackWebhookUrl,
+            debugMode
+        );
         if (!initialized) {
             rejectWithCode(call, PushAppErrorCodes.INVALID_APP_ID);
             return;
@@ -110,7 +117,7 @@ public class PushAppPlugin extends Plugin {
             return;
         }
 
-        PushApp.Companion.getInstance().login(userId, success -> {
+        PushApp.Companion.getInstance().login(userId, (success) -> {
             if (Boolean.TRUE.equals(success)) {
                 JSObject ret = new JSObject();
                 ret.put("status", "logged_in");
