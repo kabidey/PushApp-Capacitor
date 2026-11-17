@@ -724,7 +724,7 @@ private func clipPlaceholderRect(
                            let guest = device["user_id"] as? String {
                             let defaults = UserDefaults.standard
                             defaults.set(token, forKey: "apns_token")
-                            persistGuestId(guest)
+                            self.persistGuestId(guest)
                             self.slackPrint("🎉 Guest ID set: \(guest)")
                         } else {
                             self.slackPrint("⚠️ JSON structure did not match expected format")
